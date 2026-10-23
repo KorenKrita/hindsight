@@ -26,8 +26,10 @@ import { type PiEntry, type PiMessage, readPiEntries, readPiMessages } from "../
 
 interface BeforeAgentStartEvent {
   type: "before_agent_start";
-  /** The raw user prompt text. */
-  prompt: string;
+  /** "custom" runs (Pi >= 1.2.0, started by sendMessage with triggerTurn) have no prompt. */
+  messageType?: "user" | "custom";
+  /** The raw user prompt text; absent on "custom" runs. */
+  prompt?: string;
   /** The fully assembled system prompt for this turn. */
   systemPrompt: string;
   /** Present on hosts that compose the prompt from extension sections. */
@@ -155,7 +157,7 @@ export function createPiHooks(
         // before it has any knowledge (mirrors the other harnesses).
         await sessionStart;
       }
-      const prompt = event.prompt.trim();
+      const prompt = event.prompt?.trim() ?? "";
       if (prompt) await core.onPrompt(sessionId, prompt);
       const injection = core.getInjection(sessionId);
       if (!injection) {

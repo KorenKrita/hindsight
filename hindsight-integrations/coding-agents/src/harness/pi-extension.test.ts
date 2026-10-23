@@ -51,6 +51,25 @@ describe("pi extension adapter", () => {
     );
   });
 
+  it("keeps the injection and skips recall for runs started by a custom message", async () => {
+    const core = {
+      onPrompt: vi.fn(async () => {}),
+      getInjection: vi.fn(() => "<hindsight_memories>remember this</hindsight_memories>"),
+      onTranscript: vi.fn(async () => {}),
+    };
+    const hooks = createPiHooks(core as never, "pi");
+    // Pi >= 1.2.0 fires before_agent_start for sendMessage(..., { triggerTurn: true }) runs;
+    // those events have messageType "custom" and no prompt.
+    const result = await hooks.beforeAgentStart(
+      { messageType: "custom", systemPrompt: "You are pi." } as never,
+      "session-1"
+    );
+    expect(core.onPrompt).not.toHaveBeenCalled();
+    expect(result?.systemPrompt).toBe(
+      "You are pi.\n\n<hindsight_memories>remember this</hindsight_memories>"
+    );
+  });
+
   it("injects nothing when the core has no injection for this turn", async () => {
     const core = {
       onPrompt: vi.fn(async () => {}),

@@ -1568,6 +1568,16 @@ class ReflectDefaultOptions(BaseModel):
             "the same observations and ranking with a much smaller context. None means enabled."
         ),
     )
+    reflect_search_mental_models_max_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Token budget for the mental models search_mental_models returns in full, packed in rank order. "
+            "The best-ranked one is always in full; the others that do not fit come back as a snippet the "
+            "model can read with read_mental_models. Raise it for banks with long pages or answers spread "
+            "across pages; lower it to cut the reflect context. None means use the shipped default (16000)."
+        ),
+    )
 
 
 class ReflectRequest(ReflectDefaultOptions):
@@ -6661,6 +6671,7 @@ def _register_routes(app: FastAPI):
                         exclude_mental_model_ids=request.exclude_mental_model_ids,
                         reflect_search_observations_max_tokens_override=request.reflect_search_observations_max_tokens,
                         reflect_search_observations_include_entities_override=request.reflect_search_observations_include_entities,
+                        reflect_search_mental_models_max_tokens_override=request.reflect_search_mental_models_max_tokens,
                     ),
                     operation="reflect",
                     bank_id=bank_id,

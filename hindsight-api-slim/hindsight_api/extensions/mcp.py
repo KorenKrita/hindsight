@@ -9,11 +9,14 @@ Example:
 
 import logging
 from abc import abstractmethod
+from typing import TYPE_CHECKING
 
-from fastmcp import FastMCP
-
-from hindsight_api import MemoryEngine
 from hindsight_api.extensions.base import Extension
+
+if TYPE_CHECKING:
+    from fastmcp import FastMCP
+
+    from hindsight_api import MemoryEngine
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +28,14 @@ class MCPExtension(Extension):
 
     Example:
         class CloudMCPExtension(MCPExtension):
-            def register_tools(self, mcp: FastMCP, memory: MemoryEngine) -> None:
+            def register_tools(self, mcp: "FastMCP", memory: "MemoryEngine") -> None:
                 @mcp.tool()
                 async def my_custom_tool(query: str) -> str:
                     return "result"
     """
 
     @abstractmethod
-    def register_tools(self, mcp: FastMCP, memory: MemoryEngine) -> None:
+    def register_tools(self, mcp: "FastMCP", memory: "MemoryEngine") -> None:
         """Register additional MCP tools.
 
         Args:

@@ -184,12 +184,15 @@ export class RuntimeCore {
       cfg: this.cfg,
       client: this.client,
       cacheFile,
+      // The first turn's preamble below already carries the tool guide; a roster refresh on the
+      // same turn would repeat it.
+      rosterRefresh: turns !== 1,
     });
 
     const blocks: string[] = [];
     // The SessionStart-equivalent preamble, injected once on the first turn (later turns get the
-    // periodic refresh below). Built HERE, from this session's own roster, rather than reused from
-    // plugin load: that one is a process-lifetime snapshot, so a host started before the pages
+    // periodic refresh from buildHookOutput). Built HERE, from this session's own roster, rather
+    // than reused from plugin load: that one is a process-lifetime snapshot, so a host started before the pages
     // existed told every later session "No knowledge pages yet" while the same turn's memory block
     // listed pages by id (#4607).
     if (turns === 1) {

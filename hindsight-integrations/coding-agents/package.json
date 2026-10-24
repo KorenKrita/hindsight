@@ -96,6 +96,14 @@
     "test:dcode-e2e": "npm run build && HINDSIGHT_DCODE_E2E=1 vitest run src/dcode-plugin.e2e.test.ts",
     "test:harness-e2e": "npm run build && HINDSIGHT_HARNESS_E2E=1 vitest run src/harness.e2e.test.ts"
   },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@mariozechner/pi-coding-agent": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@opencode-ai/plugin": "^1.18.9",

@@ -15,22 +15,18 @@
  */
 import { createPiExtension, type ExtensionFactory } from "./harness/pi-extension";
 
-// Pi's extension loader maps this module to the RUNNING host, including compiled Pi-Bolt.
-// Do not resolve a nearby package.json: it may belong to a different globally installed Pi.
-export async function hostPiVersion(): Promise<string | undefined> {
-  try {
-    const hostModule = "@earendil-works/pi-coding-agent";
-    const host = await import(hostModule);
-    return typeof host.VERSION === "string" ? host.VERSION : undefined;
-  } catch {
-    // Older Pi releases may not provide the renamed module. Preserve their legacy injection.
-    return undefined;
-  }
+// Use a STATIC host import: a variable dynamic import in bundled dist/pi.js bypasses Pi-Bolt's
+// virtual modules and silently loses VERSION. Pi maps the original package name too, so this also
+// loads on older hosts from before the @earendil-works rename. Never bundle a second copy of Pi.
+import * as host from "@mariozechner/pi-coding-agent";
+
+export function hostPiVersion(): string | undefined {
+  return typeof host.VERSION === "string" ? host.VERSION : undefined;
 }
 
 const HARNESS = "pi";
-const extension: ExtensionFactory = async (pi) => {
-  createPiExtension(HARNESS, undefined, await hostPiVersion())(pi);
+const extension: ExtensionFactory = (pi) => {
+  createPiExtension(HARNESS, undefined, hostPiVersion())(pi);
 };
 
 export { extension };

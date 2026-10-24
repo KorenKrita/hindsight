@@ -3,37 +3,80 @@ import { describe, expect, it, vi } from "vitest";
 import { resolveConfig, type RawConfig } from "../core/config";
 import type { HindsightClient } from "../core/hindsight";
 import { RuntimeCore } from "../core/runtime";
-import { createPiExtension } from "./pi-extension";
+import * as sessionCache from "../core/session-cache";
+import { createPiExtension, usesStablePiContext } from "./pi-extension";
 
 interface Message {
   role: string;
   content: unknown;
   customType?: string;
+  sections?: Record<string, string>;
+  timestamp?: number;
 }
 interface Entry {
   type: string;
   customType?: string;
-  data?: unknown;
   content?: string;
+  message?: Message;
 }
 
-// Exercise the registered Pi handlers and real RuntimeCore/buildHookOutput, with only the bank
-// client and host transport stubbed. No server, seed, installer or user configuration is touched.
-function fixture(config: RawConfig = {}) {
+// Each session has its OWN branch, full entry tree and request messages. before_agent_start sees
+// the previous leaf: the host appends system delta, user, returned custom message, in that order.
+function session(copy: Entry[] = []) {
+  const id = randomUUID();
+  const branch = structuredClone(copy);
+  const entries = [...branch];
+  const messages: Message[] = [];
+  const rebuild = () => {
+    messages.splice(
+      0,
+      messages.length,
+      ...branch.flatMap((e) =>
+        e.type === "message" && e.message
+          ? [e.message]
+          : e.type === "custom_message"
+            ? [{ role: "custom", content: e.content, customType: e.customType }]
+            : []
+      )
+    );
+  };
+  rebuild();
+  const append = (e: Entry) => {
+    branch.push(e);
+    entries.push(e);
+    rebuild();
+  };
+  return {
+    id,
+    branch,
+    entries,
+    messages,
+    append,
+    rewind(length: number) {
+      branch.splice(length);
+      rebuild();
+    },
+    ctx: {
+      cwd: process.cwd(),
+      sessionManager: {
+        getSessionId: () => id,
+        getBranch: () => branch,
+        getEntries: () => entries,
+      },
+    },
+  };
+}
+
+function fixture(config: RawConfig = {}, version: string | undefined = "1.4.0", harness = "pi") {
   const client = {
     listPages: vi.fn(async () => ({ items: [{ id: "p1", name: "Decisions" }] })),
-    searchKnowledgePages: vi.fn(async () => [{ id: "p1", name: "Decisions", snippet: "PAGE-HIT" }]),
+    searchKnowledgePages: vi.fn(async (prompt: string) => [
+      { id: "p1", name: "Decisions", snippet: `PAGE-HIT:${prompt}` },
+    ]),
     reflect: vi.fn(async () => "REFLECT-ANSWER"),
     recallObservations: vi.fn(async () => ["RECALL-HIT"]),
   };
-  const branch: Entry[] = [];
-  const messages: Message[] = [];
-  const sessionId = randomUUID();
-  const ctx = {
-    cwd: process.cwd(),
-    sessionManager: { getSessionId: () => sessionId, getBranch: () => branch },
-  };
-  function load(extra = "", harness = "pi") {
+  function load(extra = "ORIGINAL-GUIDANCE") {
     const core = new RuntimeCore(
       client as unknown as HindsightClient,
       "offline-bank",
@@ -47,32 +90,34 @@ function fixture(config: RawConfig = {}) {
     );
     vi.spyOn(core, "seedIfCold").mockResolvedValue();
     const onTranscript = vi.spyOn(core, "onTranscript").mockResolvedValue();
+    const clear = vi.spyOn(core, "clearSessionState");
     const handlers: Record<string, (...args: any[]) => any> = {};
     createPiExtension(
       harness,
-      () => core
+      () => core,
+      version
     )({
       on: (event: string, handler: (...args: any[]) => any) => {
         handlers[event] = handler;
       },
       registerTool: () => {},
-      appendEntry: (customType: string, data: unknown) =>
-        branch.push({ type: "custom", customType, data }),
     } as never);
-    handlers.session_start({}, ctx);
-    return { handlers, onTranscript };
+    return { core, handlers, onTranscript, clear };
   }
-  let host = load("ORIGINAL-GUIDANCE");
+  let host = load();
   return {
     client,
-    branch,
-    messages,
-    ctx,
-    reload(extra = "CHANGED-GUIDANCE") {
+    get host() {
+      return host;
+    },
+    async reload(extra = "ORIGINAL-GUIDANCE") {
+      await host.handlers.session_shutdown();
       host = load(extra);
     },
-    load,
-    async prompt(prompt: string | undefined = "Implement the decision", context = ctx) {
+    async prompt(
+      s: ReturnType<typeof session>,
+      prompt: string | undefined = "Implement the decision"
+    ) {
       const sections: Record<string, string> = { base: "Pi", other: "OTHER-EXTENSION" };
       const event = {
         prompt,
@@ -80,153 +125,311 @@ function fixture(config: RawConfig = {}) {
         systemPrompt: "Pi",
         systemPromptOptions: { sections },
       };
-      const result = await host.handlers.before_agent_start(event, context);
-      if (prompt) messages.push({ role: "user", content: prompt });
-      if (result?.message) {
-        branch.push({ type: "custom_message", ...result.message });
-        messages.push({ role: "custom", ...result.message });
+      const result = await host.handlers.before_agent_start(event, s.ctx);
+      const prior = s.branch.filter((e) => e.message?.role === "system").at(-1)?.message?.sections;
+      if (JSON.stringify(prior) !== JSON.stringify(sections)) {
+        s.append({ type: "message", message: { role: "system", content: "", sections } });
       }
+      if (prompt) s.append({ type: "message", message: { role: "user", content: prompt } });
+      if (result?.message) s.append({ type: "custom_message", ...result.message });
       return { sections, result };
     },
-    context(context = ctx) {
-      return host.handlers.context({ messages }, context)?.messages ?? messages;
+    request(s: ReturnType<typeof session>): Message[] {
+      const messages = structuredClone(s.messages);
+      return host.handlers.context?.({ messages }, s.ctx)?.messages ?? messages;
     },
-    async end() {
-      await host.handlers.agent_end({ messages }, ctx);
-    },
+    end: (s: ReturnType<typeof session>) =>
+      host.handlers.agent_end({ messages: s.messages }, s.ctx),
   };
 }
 
+const recalls = (s: ReturnType<typeof session>) =>
+  s.branch.filter((e) => e.customType === "hindsight-recall");
+
 describe("Pi stable system section", () => {
   it.each([1, 2, 3, 20])(
-    "keeps one section and one recall across eight prompts and reload (cadence %i)",
+    "preserves EVERY request prefix across turns, tool loops and reload (cadence %i)",
     async (cadence) => {
       const f = fixture({ pageRefreshEveryTurns: cadence });
+      const s = session();
+      let previous: Message[] = [];
       let stable: string | undefined;
-      const sections: string[] = [];
       for (let turn = 1; turn <= 8; turn++) {
-        if (turn === 4) f.reload(); // fresh RuntimeCore and adapter, same durable session
+        if (turn === 4) await f.reload();
         f.client.listPages.mockResolvedValue({
           items: Array.from({ length: turn }, (_, i) => ({ id: `p${i}`, name: `Page ${i}` })),
         });
-        const out = await f.prompt();
+        const out = await f.prompt(s, `turn ${turn}`);
         stable ??= out.sections.hindsight;
-        sections.push(out.sections.hindsight);
         expect(out.sections).toEqual({ base: "Pi", other: "OTHER-EXTENSION", hindsight: stable });
-        expect(stable).toContain("ORIGINAL-GUIDANCE");
-        expect(stable).not.toMatch(
-          /PAGE-HIT|hindsight_knowledge_refresh|\d knowledge pages|CHANGED-GUIDANCE/
-        );
-        expect(out.result?.systemPrompt).toBeUndefined();
-        const request = f.context();
-        expect(request.filter((m: Message) => m.customType === "hindsight-recall")).toHaveLength(1);
-        // A repeated context callback (tool continuation/provider retry) gets one reminder, not an
-        // accumulation. The host's original message list and its durable branch never get one.
-        expect(f.context().map((m: Message) => [m.role, m.content])).toEqual(
-          request.map((m: Message) => [m.role, m.content])
-        );
-        expect(f.messages.some((m) => m.customType === "hindsight-roster-refresh")).toBe(false);
-        if (turn === 6) {
-          expect(request.some((m: Message) => m.customType === "hindsight-roster-refresh")).toBe(
-            6 % cadence === 0
-          );
+        expect(stable).not.toMatch(/PAGE-HIT|hindsight_knowledge_refresh|\d knowledge page/);
+        // Three tool continuations, plus the final text-only request in EVERY user turn.
+        for (let loop = 0; loop < 4; loop++) {
+          const request = f.request(s);
+          expect(request.slice(0, previous.length)).toEqual(previous);
+          expect(request).toEqual(s.messages);
+          previous = request;
+          s.append({
+            type: "message",
+            message: {
+              role: "assistant",
+              content:
+                loop < 3
+                  ? [
+                      {
+                        type: "toolCall",
+                        id: `${turn}-${loop}`,
+                        name: "read",
+                        arguments: { path: "a" },
+                      },
+                    ]
+                  : [{ type: "text", text: "Done" }],
+            },
+          });
+          if (loop < 3)
+            s.append({
+              type: "message",
+              message: { role: "toolResult", content: `result ${turn}-${loop}` },
+            });
         }
-        await f.end();
-        expect(f.context()).toEqual(f.messages);
+        await f.end(s);
+        // Retry/recovery after agent_end must not remove any extension context either.
+        expect(f.request(s).slice(0, previous.length)).toEqual(previous);
       }
-      expect(new Set(sections).size).toBe(1);
+      expect(f.host.handlers.context).toBeUndefined();
       expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(1);
-      expect(f.branch.filter((e) => e.customType === "hindsight-recall")).toHaveLength(1);
-      expect(f.branch.filter((e) => e.customType === "hindsight-system-guidance")).toHaveLength(1);
-      expect(f.branch.some((e) => e.customType === "hindsight-roster-refresh")).toBe(false);
+      expect(f.client.listPages).toHaveBeenCalledTimes(1);
+      expect(recalls(s)).toHaveLength(1);
+      expect(s.messages[1].role).toBe("user");
+      expect(s.messages[2].customType).toBe("hindsight-recall");
+      expect(s.messages[2].content).toContain("1 knowledge page.");
+      expect(s.branch.filter((e) => e.message?.role === "system")).toHaveLength(1);
+      expect(s.branch.some((e) => e.type === "custom")).toBe(false);
     }
   );
 
+  it("derives sections only from config, including changed config after reload and on another branch", async () => {
+    const f = fixture();
+    const a = session();
+    const first = await f.prompt(a);
+    a.rewind(0);
+    await f.reload("NEW-GUIDANCE");
+    const changed = await f.prompt(a);
+    expect(changed.sections.hindsight).toContain("NEW-GUIDANCE");
+    expect(changed.sections.hindsight).not.toBe(first.sections.hindsight);
+    expect((await f.prompt(a)).sections.hindsight).toBe(changed.sections.hindsight);
+    expect((await f.prompt(session())).sections.hindsight).toBe(changed.sections.hindsight);
+  });
+
+  it("uses branch entries, not temp cache, after fork, compaction and reload", async () => {
+    const read = vi.spyOn(sessionCache, "readSessionCache");
+    const write = vi.spyOn(sessionCache, "writeSessionCache");
+    try {
+      const f = fixture();
+      const a = session();
+      await f.prompt(a);
+      const fork = session(a.branch);
+      await f.reload();
+      await f.prompt(fork);
+      // Raw branch still includes recall even when normal compaction removes it from projection.
+      fork.append({ type: "compaction" });
+      await f.reload();
+      await f.prompt(fork);
+      expect(recalls(fork)).toHaveLength(1);
+      expect(recalls(a)).toHaveLength(1);
+      expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(1);
+      expect(read).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      read.mockRestore();
+      write.mockRestore();
+    }
+  });
+
+  it("restores a discarded first recall from the session tree, even after reload", async () => {
+    const f = fixture();
+    const a = session();
+    await f.prompt(a, "original goal");
+    const content = recalls(a)[0].content;
+    a.rewind(1); // /tree chooses the first user entry; Pi sets leaf to its parent (system).
+    await f.reload();
+    await f.prompt(a, "edited goal");
+    expect(recalls(a)).toHaveLength(1);
+    expect(recalls(a)[0].content).toBe(content);
+    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(1);
+    // A /fork at the same point copies only that branch, not the abandoned recall. Re-query once.
+    const fork = session(a.branch.slice(0, 1));
+    await f.prompt(fork, "forked goal");
+    expect(recalls(fork)[0].content).toContain("PAGE-HIT:forked goal");
+    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers a missing recall after the first user node, but does not inject into unrelated old history", async () => {
+    const f = fixture();
+    const a = session();
+    await f.prompt(a);
+    a.rewind(2); // SDK branch retaining the user but not its following recall
+    await f.prompt(a);
+    expect(recalls(a)).toHaveLength(1);
+    const old = session([{ type: "message", message: { role: "user", content: "old prompt" } }]);
+    await f.prompt(old);
+    expect(recalls(old)).toHaveLength(0);
+    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(1);
+  });
+
+  it("isolates full histories for concurrent sessions and ignores custom-message runs", async () => {
+    const f = fixture();
+    const a = session();
+    const b = session();
+    await f.prompt(a, ""); // custom run is not the first user prompt
+    expect(recalls(a)).toHaveLength(0);
+    await Promise.all([f.prompt(a, "GOAL-A"), f.prompt(b, "GOAL-B")]);
+    expect(recalls(a)[0].content).toContain("GOAL-A");
+    expect(recalls(a)[0].content).not.toContain("GOAL-B");
+    expect(recalls(b)[0].content).toContain("GOAL-B");
+    expect(recalls(b)[0].content).not.toContain("GOAL-A");
+    expect(a.branch).not.toBe(b.branch);
+    expect(f.request(a)).not.toEqual(f.request(b));
+    await f.prompt(a, "");
+    expect(recalls(a)).toHaveLength(1);
+    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["reflect", "recall", "none"] as const)(
-    "preserves %s auto-injection semantics",
+    "honors autoInject=%s without later re-injection",
     async (autoInject) => {
       const f = fixture({ autoInject });
-      await f.prompt();
-      f.reload();
-      await f.prompt();
+      const a = session();
+      await f.prompt(a);
+      await f.reload();
+      await f.prompt(a);
       expect(f.client.reflect).toHaveBeenCalledTimes(autoInject === "reflect" ? 1 : 0);
       expect(f.client.recallObservations).toHaveBeenCalledTimes(autoInject === "recall" ? 1 : 0);
       expect(f.client.searchKnowledgePages).not.toHaveBeenCalled();
-      expect(f.messages.filter((m) => m.customType === "hindsight-recall")).toHaveLength(
-        autoInject === "none" ? 0 : 1
-      );
+      expect(recalls(a)).toHaveLength(autoInject === "none" ? 0 : 1);
     }
   );
 
   it.each(["empty", "failure"])(
-    "keeps bounded retry behavior after an %s first retrieval",
+    "does not retry an %s opening retrieval on later prompts; a fresh branch may try again",
     async (outcome) => {
       const f = fixture();
+      const a = session();
       if (outcome === "empty") f.client.searchKnowledgePages.mockResolvedValueOnce([]);
       else f.client.searchKnowledgePages.mockRejectedValueOnce(new Error("offline"));
-      const first = await f.prompt();
-      expect(first.result?.message).toBeUndefined();
-      f.reload();
-      const second = await f.prompt();
-      expect(second.sections.hindsight).toBe(first.sections.hindsight);
-      expect(second.result?.message.content).toContain("PAGE-HIT");
-      await f.prompt();
-      expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(2);
-      expect(f.messages.filter((m) => m.customType === "hindsight-recall")).toHaveLength(1);
+      await f.prompt(a);
+      await f.reload();
+      await f.prompt(a);
+      expect(recalls(a)).toHaveLength(0);
+      expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(1);
+      a.rewind(1);
+      await f.prompt(a);
+      expect(recalls(a)).toHaveLength(1);
     }
   );
 
-  it("isolates sessions and skips recall/stale reminders on custom-message runs", async () => {
+  it("honors a later autoInject=none even when an abandoned branch has a saved recall", async () => {
     const f = fixture();
-    const first = await f.prompt();
-    const custom = await f.prompt("");
-    expect(custom.sections.hindsight).toBe(first.sections.hindsight);
-    expect(custom.result).toBeUndefined();
-    expect(f.context()).toEqual(f.messages);
-    const otherId = randomUUID();
-    const other = {
-      ...f.ctx,
-      sessionManager: { getSessionId: () => otherId, getBranch: () => [] },
-    };
-    expect(f.context(other)).toEqual(f.messages);
-    await f.prompt("A different goal", other);
-    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(2);
+    const a = session();
+    await f.prompt(a);
+    a.rewind(1);
+    const disabled = fixture({ autoInject: "none" });
+    await disabled.prompt(a);
+    expect(recalls(a)).toHaveLength(0);
+    expect(disabled.client.searchKnowledgePages).not.toHaveBeenCalled();
   });
 
-  it("keeps Prime Agent on its existing system-injection path", async () => {
+  it("does not guess delivery state when getBranch is unavailable", async () => {
     const f = fixture();
-    const { handlers } = f.load("", "prime-agent");
     const sections: Record<string, string> = {};
-    const result = await handlers.before_agent_start(
+    const result = await f.host.handlers.before_agent_start(
       { prompt: "hello", systemPrompt: "Pi", systemPromptOptions: { sections } },
-      f.ctx
+      { sessionManager: { getSessionId: () => "unknown-branch" } }
     );
-    expect(sections.hindsight).toContain("PAGE-HIT");
+    expect(sections.hindsight).toContain("ORIGINAL-GUIDANCE");
     expect(result).toBeUndefined();
-    expect(handlers.context).toBeUndefined();
-    expect(f.branch).toEqual([]);
+    expect(f.client.searchKnowledgePages).not.toHaveBeenCalled();
   });
 
-  it("does not retain the persistent custom recall as user conversation", async () => {
+  it("does not turn an inventory failure into a false zero-page report", async () => {
     const f = fixture();
-    const { handlers, onTranscript } = f.load();
-    await handlers.agent_end(
-      {
-        messages: [
+    const a = session();
+    f.client.listPages.mockRejectedValue(new Error("offline"));
+    await f.prompt(a);
+    expect(recalls(a)[0].content).toContain("PAGE-HIT");
+    expect(recalls(a)[0].content).not.toContain("knowledge_inventory");
+  });
+
+  it.each(["0.80.10", "0.87.1", "1.3.9", "unknown"])(
+    "keeps Pi %s on the legacy path even with sections",
+    async (version) => {
+      const f = fixture({}, version);
+      const out = await f.prompt(session());
+      expect(out.sections.hindsight).toContain("PAGE-HIT");
+      expect(out.result).toBeUndefined();
+    }
+  );
+
+  it("keeps Prime Agent on the legacy path even with a modern version and sections", async () => {
+    const f = fixture({}, "1.4.0", "prime-agent");
+    const out = await f.prompt(session());
+    expect(out.sections.hindsight).toContain("PAGE-HIT");
+    expect(out.result).toBeUndefined();
+  });
+
+  it.each([undefined, "", "1.4.0-beta", "0.87.1", "1.3.99"])(
+    "fails closed for version %s",
+    (version) => {
+      expect(usesStablePiContext(version)).toBe(false);
+    }
+  );
+  it.each(["1.4.0", "1.4.1", "1.14.0", "2.0.0", "1.4.0+bolt"])("accepts version %s", (version) => {
+    expect(usesStablePiContext(version)).toBe(true);
+  });
+
+  it("releases runtime session tables on session_shutdown (also emitted by Pi on switch/reload)", async () => {
+    const f = fixture({}, "0.87.1");
+    const a = session();
+    await f.prompt(a);
+    expect(f.host.core.getInjection(a.id)).toBeTruthy();
+    const old = f.host;
+    await f.reload();
+    expect(old.clear).toHaveBeenCalledOnce();
+    expect(old.core.getInjection(a.id)).toBeFalsy();
+    expect(
+      Object.values(old.core)
+        .filter((v) => v instanceof Map)
+        .every((v) => v.size === 0)
+    ).toBe(true);
+  });
+
+  it.each([true, false])(
+    "excludes all custom messages and old guidance snapshots from retain (branch=%s)",
+    async (branchAvailable) => {
+      const f = fixture();
+      const a = session();
+      await f.prompt(a, "actual prompt");
+      a.append({
+        type: "custom",
+        customType: "hindsight-system-guidance",
+        content: "old snapshot",
+      });
+      a.append({
+        type: "custom_message",
+        customType: "hindsight-future",
+        content: "future injected data",
+      });
+      a.append({ type: "message", message: { role: "assistant", content: "actual answer" } });
+      const ctx = branchAvailable ? a.ctx : { sessionManager: { getSessionId: () => a.id } };
+      await f.host.handlers.agent_end({ messages: a.messages }, ctx);
+      expect(f.host.onTranscript).toHaveBeenCalledWith(
+        a.id,
+        [
           { role: "user", content: "actual prompt" },
-          { role: "custom", customType: "hindsight-recall", content: "PAGE-HIT" },
           { role: "assistant", content: "actual answer" },
         ],
-      },
-      { ...f.ctx, sessionManager: { getSessionId: () => "s" } }
-    );
-    expect(onTranscript).toHaveBeenCalledWith(
-      "s",
-      [
-        { role: "user", content: "actual prompt" },
-        { role: "assistant", content: "actual answer" },
-      ],
-      true
-    );
-  });
+        true
+      );
+    }
+  );
 });

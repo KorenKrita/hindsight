@@ -7,16 +7,14 @@ describe("pi extension adapter", () => {
   it.each(["before", "after"])("preserves sections added %s memory injection", async (order) => {
     const core = {
       onPrompt: vi.fn(async () => {}),
-      getPromptContext: vi.fn(() => ({
-        pages: [],
-        recallContext: "<hindsight_memories>remember this</hindsight_memories>",
-      })),
+      recallForPrompt: vi.fn(async () => "<hindsight_memories>remember this</hindsight_memories>"),
+      clearSessionState: vi.fn(),
       getInjection: vi.fn(() => "<hindsight_memories>remember this</hindsight_memories>"),
       getSystemGuidance: vi.fn(() => "Stable tool guide"),
       onTranscript: vi.fn(async () => {}),
       flush: vi.fn(async () => {}),
     };
-    const hooks = createPiHooks(core, "pi");
+    const hooks = createPiHooks(core, "pi", undefined, "1.4.0");
     const sections: Record<string, string> = { base: "You are pi." };
     if (order === "before") sections.other = "SECTION-MARKER";
     const result = await hooks.beforeAgentStart(
@@ -25,7 +23,8 @@ describe("pi extension adapter", () => {
         systemPrompt: Object.values(sections).join("\n\n"),
         systemPromptOptions: { sections },
       },
-      "session-1"
+      "session-1",
+      []
     );
     if (order === "after") sections.other = "SECTION-MARKER";
     const prompt = result?.systemPrompt ?? Object.values(sections).join("\n\n");
@@ -132,7 +131,13 @@ describe("pi extension adapter", () => {
   it("writes back the whole session branch, not just the latest run's messages (#4963)", async () => {
     const onTranscript = vi.fn(async () => {});
     const flush = vi.fn(async () => {});
-    const core = { onPrompt: vi.fn(), getInjection: vi.fn(), onTranscript, flush };
+    const core = {
+      onPrompt: vi.fn(),
+      getInjection: vi.fn(),
+      onTranscript,
+      flush,
+      clearSessionState: vi.fn(),
+    };
     const hooks = createPiHooks(core as never, "pi");
     const msg = (role: string, text: string) => ({
       type: "message",
@@ -198,6 +203,7 @@ describe("pi extension factory", () => {
   function fakeCore(repo: string) {
     return {
       seedIfCold: vi.fn(async () => {}),
+      clearSessionState: vi.fn(),
       onPrompt: vi.fn(async () => {}),
       getInjection: vi.fn(() => undefined),
       onTranscript: vi.fn(async () => {}),

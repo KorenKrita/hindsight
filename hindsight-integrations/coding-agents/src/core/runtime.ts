@@ -31,7 +31,7 @@ import { memoryUsageCursorStore, recordUsage } from "./usage";
 import { buildRetainStamp } from "./retain-stamp";
 import { buildSessionStartContext } from "./session-start";
 import { syncCompanionSkill } from "./skill-sync";
-import { buildHookOutput, type HookOutput } from "./hook";
+import { buildHookOutput } from "./hook";
 import { sessionCacheFile, writeSessionCache } from "./session-cache";
 
 const HARNESS = "opencode";
@@ -40,13 +40,12 @@ const FLUSH_TIMEOUT_MS = 10_000;
 
 export class RuntimeCore {
   private readonly injection = new Map<string, string>(); // sessionId -> this turn's injection block
-  private readonly promptContext = new Map<string, HookOutput>();
   private readonly turnCount = new Map<string, number>(); // sessionId -> user-turn counter (cadence)
   private readonly sessionState = new Map<string, { startTs: string; retainedTurns: number }>();
   /** Live write-back cursors. In memory, unlike the hook harnesses': this host outlives the session. */
-  private readonly cursors = memoryCursorStore();
+  private cursors = memoryCursorStore();
   /** Turns already written to the usage log (core/usage.ts), per session. */
-  private readonly usageCursors = memoryUsageCursorStore();
+  private usageCursors = memoryUsageCursorStore();
   /** Pulls a session's CURRENT transcript from the host (set by the adapter); see onSessionIdle. */
   private fetchTranscript?: (sessionId: string) => Promise<TransportTurn[]>;
   /** Write-backs started and not yet settled — what `flush` waits for. */
@@ -212,17 +211,29 @@ export class RuntimeCore {
     const block = blocks.filter(Boolean).join("\n\n");
     this.injection.set(sessionId, block);
     this.lastInjection = block; // for consumers that can't supply a sessionId (see getInjection)
-    // Pi separates once-only recall and request-local reminders from its stable system guide.
-    // Other hosts keep reading the identical combined block through getInjection.
-    this.promptContext.set(sessionId, output);
   }
 
-  /** Unlike getInjection's legacy fallback, these channels must never cross session boundaries. */
-  getPromptContext(sessionId: string): HookOutput | undefined {
-    return this.promptContext.get(sessionId);
+  /** Pi 1.4+ calls this only when its branch needs the opening recall. No /tmp state, turn
+   *  counters, roster cadence, or cold-seed marker may decide whether that branch has memory.
+   *  An empty/failed first attempt is not retried on later prompts; explicit tools remain available. */
+  async recallForPrompt(prompt: string, saved?: string): Promise<string | undefined> {
+    if (process.env.HINDSIGHT_DISABLE_HOOKS || !prompt.trim() || this.cfg.autoInject === "none")
+      return;
+    if (saved) return saved;
+    const output = await buildHookOutput({
+      harness: this.harness,
+      prompt,
+      cfg: { ...this.cfg, pageRefreshEveryTurns: 0 },
+      client: this.client,
+    });
+    if (!output.recallContext) return;
+    const inventory = output.pagesKnown
+      ? `\n\n<hindsight_knowledge_inventory>\nAt this opening recall, the repository has ${output.pages.length} knowledge ${output.pages.length === 1 ? "page" : "pages"}. Use hindsight_list_knowledge_pages for the current inventory.\n</hindsight_knowledge_inventory>`
+      : "";
+    return output.recallContext + inventory;
   }
 
-  /** Stable guidance for hosts that persist system-section deltas, snapshotted by the adapter. */
+  /** Pure config-derived guidance: identical across sessions, branches and reloads. */
   getSystemGuidance(): string | undefined {
     if (process.env.HINDSIGHT_DISABLE_HOOKS) return;
     return buildStableKnowledgePreamble({
@@ -353,6 +364,17 @@ export class RuntimeCore {
     clearTimeout(timer);
   }
 
+  /** Pi emits session_shutdown on exit, reload, /new, /resume and /fork. Release all session
+   *  tables, including legacy delivery state; the persisted transcript remains authoritative. */
+  clearSessionState(): void {
+    this.injection.clear();
+    this.turnCount.clear();
+    this.sessionState.clear();
+    this.lastInjection = "";
+    this.cursors = memoryCursorStore();
+    this.usageCursors = memoryUsageCursorStore();
+  }
+
   /** Fire-and-forget upsert of the session transcript; never throws into the host. */
   private retain(
     sessionId: string,
@@ -361,6 +383,8 @@ export class RuntimeCore {
     trigger = "turn"
   ): void {
     const t0 = Date.now();
+    // A timed-out shutdown may clear session state before this write settles. Keep its old store.
+    const cursors = this.cursors;
     // Daemon mode: the write path is the last chance to get a daemon up — the Stop-hook role, for
     // hosts that have no Stop hook. A daemon that died mid-session would otherwise take the whole
     // exchange with it. The wait sits INSIDE the fire-and-forget chain, so
@@ -370,7 +394,7 @@ export class RuntimeCore {
     const write = ensureDaemon(this.cfg, this.harness, { waitMs: DAEMON_WAIT_RETAIN_MS })
       .then(() =>
         retainLiveSession(this.client, sessionId, turns, startTs, this.harness, {
-          cursors: this.cursors,
+          cursors,
           stamp: buildRetainStamp(this.cfg, {
             directory: this.projectDir,
             harness: this.harness,

@@ -115,8 +115,8 @@ function toolGuide(opts?: ToolGuideOpts): string {
   );
 }
 
-/** Pi diffs prompt sections into durable system messages. Keep its guide independent of page
- *  counts/availability; recall and periodic roster updates travel in separate message channels. */
+/** Pi diffs prompt sections into durable system messages. This pure config-only guide must not
+ *  depend on page counts/availability; opening recall travels in a fixed persistent message. */
 export function buildStableKnowledgePreamble(opts?: ToolGuideOpts): string {
   return (
     "<hindsight_knowledge>\n" +

@@ -227,6 +227,8 @@ export interface HookOutput {
    *  SessionStart preamble from this too, so a turn can no longer be told both "no pages yet" and
    *  a list of pages in the same context (#4607). Empty also signals a bank the engine never built. */
   pages: PageRef[];
+  /** False when the inventory request failed; do not describe an unknown inventory as empty. */
+  pagesKnown?: boolean;
 }
 
 /**
@@ -238,11 +240,12 @@ export async function buildHookOutput(args: {
   prompt: string;
   cfg: Config;
   client: HookClient;
-  cacheFile: string;
+  /** Omit for one stateless attempt (Pi uses its branch, not a temp cache, as delivery state). */
+  cacheFile?: string;
 }): Promise<HookOutput> {
   const { harness, prompt, cfg, client, cacheFile } = args;
 
-  const cached = readSessionCache(cacheFile);
+  const cached: SessionCache = cacheFile ? readSessionCache(cacheFile) : {};
   const turns = (cached.turns ?? 0) + 1;
 
   // ── auto-inject: once per session, on the first prompt ────────────────────────
@@ -353,10 +356,12 @@ export async function buildHookOutput(args: {
   const cadence = cfg.pageRefreshEveryTurns;
   const stale = !cached.pages || (cadence > 0 && turns - cached.pages.atTurn >= cadence);
   let pages = cached.pages?.list ?? [];
+  let pagesKnown = !!cached.pages;
   if (stale) {
     const t0 = Date.now();
     try {
       pages = parsePageList(await client.listPages());
+      pagesKnown = true;
       diag(harness, "pages_ok", { ms: Date.now() - t0, count: pages.length });
     } catch (e) {
       diag(
@@ -370,12 +375,14 @@ export async function buildHookOutput(args: {
     }
   }
 
-  writeSessionCache(cacheFile, {
-    turns,
-    reflectAnswer,
-    reflectAttempts,
-    pages: { atTurn: stale ? turns : (cached.pages?.atTurn ?? turns), list: pages },
-  } satisfies SessionCache);
+  if (cacheFile) {
+    writeSessionCache(cacheFile, {
+      turns,
+      reflectAnswer,
+      reflectAttempts,
+      pages: { atTurn: stale ? turns : (cached.pages?.atTurn ?? turns), list: pages },
+    } satisfies SessionCache);
+  }
 
   // Hook-injected context lands in the USER MESSAGE and persists in the transcript — unlike a
   // system prompt, it accumulates. The reflect block is injected exactly ONCE, the turn reflect
@@ -430,6 +437,7 @@ export async function buildHookOutput(args: {
     rosterContext,
     notice,
     pages,
+    pagesKnown,
   };
 }
 

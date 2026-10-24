@@ -5,9 +5,9 @@
  * Prime Agent (PrimeIntellect) is a fork of pi and loads the same shape from
  * `~/.prime/agent/settings.json`. Both call an extension's default export with their `pi` API, and
  * both expose `before_agent_start` (recall + prompt injection), `agent_end` (transcript write-back),
- * and `registerTool` for the native `hindsight_*` knowledge tools. Modern Pi additionally uses
- * `context` for request-local reminders and session entries to freeze its system guide across
- * reloads; Prime Agent and older Pi keep their original combined system-prompt injection. The
+ * and `registerTool` for the native `hindsight_*` knowledge tools. Pi 1.4+ uses a config-only system
+ * guide and a once-per-branch persistent recall message, never request-local tail messages;
+ * Prime Agent and older Pi keep their original combined system-prompt injection. The
  * harness name also selects `harnesses.<name>` config, feeds `{harness}` bank templating, and keeps
  * sessions attributable in diagnostics separately.
  *
@@ -49,16 +49,29 @@ interface BeforeAgentStartResult {
 
 interface PiSessionEntry extends PiEntry {
   customType?: string;
-  data?: unknown;
+  content?: unknown;
 }
 
-const GUIDANCE_ENTRY = "hindsight-system-guidance";
+const RECALL_MESSAGE = "hindsight-recall";
+
+/** Sections/durable diffs exist since Pi 0.86.0, but this delivery policy is only for 1.4+.
+ *  Unknown versions fail closed to the legacy path, not a guess based on an event field. */
+export function usesStablePiContext(version: string | undefined): boolean {
+  const match = version?.match(/^(\d+)\.(\d+)\.(\d+)(?:\+[^\s]+)?$/);
+  return !!match && (+match[1] > 1 || (+match[1] === 1 && +match[2] >= 4));
+}
+
+function isRecall(entry: PiSessionEntry): boolean {
+  return entry.type === "custom_message" && entry.customType === RECALL_MESSAGE;
+}
 
 interface SessionManagerLike {
   getSessionId(): string;
   /** Every entry from the session root to the current leaf, already holding this run's messages
    *  when `agent_end` fires. Optional: a host without it falls back to the event's messages. */
   getBranch?(): readonly PiSessionEntry[];
+  /** Only used to recover a recall from an abandoned branch, never to decide current delivery. */
+  getEntries?(): readonly PiSessionEntry[];
 }
 
 /** Only what this adapter reads. Both hosts also expose a UI notifier, but the seed banner it would
@@ -101,19 +114,11 @@ interface ExtensionAPI {
     event: "agent_end",
     handler: (event: AgentEndEvent, ctx: ExtensionContext) => Promise<void> | void
   ): void;
-  on(
-    event: "context",
-    handler: (
-      event: { messages: PiMessage[] },
-      ctx: ExtensionContext
-    ) => { messages: PiMessage[] } | undefined
-  ): void;
   on(event: "session_shutdown", handler: () => Promise<void> | void): void;
-  appendEntry(customType: string, data: unknown): void;
   registerTool(definition: ToolDefinition): void;
 }
 
-export type ExtensionFactory = (pi: ExtensionAPI) => void;
+export type ExtensionFactory = (pi: ExtensionAPI) => void | Promise<void>;
 
 /**
  * Adapt a harness-agnostic ToolSpec (MCP-shaped, shared by every harness) to a pi native tool. The
@@ -161,64 +166,61 @@ export function createPiHooks(
     | "onPrompt"
     | "getInjection"
     | "getSystemGuidance"
-    | "getPromptContext"
+    | "recallForPrompt"
     | "onTranscript"
     | "flush"
+    | "clearSessionState"
   >,
   harness: string,
   sessionStart?: Promise<void>,
-  appendEntry?: ExtensionAPI["appendEntry"]
+  piVersion?: string
 ) {
-  let sessionStartAwaited = false;
-  const guidance = new Map<string, string>();
-  const reminders = new Map<string, string>();
   return {
     async beforeAgentStart(
       event: Omit<BeforeAgentStartEvent, "type">,
       sessionId: string,
-      branch?: readonly PiSessionEntry[]
+      branch?: readonly PiSessionEntry[],
+      entries?: readonly PiSessionEntry[]
     ): Promise<BeforeAgentStartResult | undefined> {
-      if (!sessionStartAwaited) {
-        sessionStartAwaited = true;
-        // Awaiting the shared SessionStart lifecycle before the first prompt preserves the invariant
-        // that a brand-new bank skips its first auto-reflect instead of spending that synthesis
-        // before it has any knowledge (mirrors the other harnesses).
-        await sessionStart;
+      // Await the same promise on every call: simultaneous sessions must not race cold seeding.
+      await sessionStart;
+      const prompt = event.messageType === "custom" ? "" : (event.prompt?.trim() ?? "");
+      if (
+        harness === "pi" &&
+        usesStablePiContext(piVersion) &&
+        event.systemPromptOptions?.sections
+      ) {
+        const stable = core.getSystemGuidance();
+        if (stable !== undefined) event.systemPromptOptions.sections.hindsight = stable;
+        // before_agent_start runs BEFORE this run's user message is persisted. getBranch includes
+        // compacted entries too, so compaction must not revive an already delivered recall.
+        // Without a branch we cannot safely decide: keep the guide, but do not risk duplication.
+        if (!stable || !prompt || !branch || branch.some(isRecall)) return undefined;
+        const firstPrompt = !branch.some(
+          (entry) => entry.type === "message" && entry.message?.role === "user"
+        );
+        // /tree can discard the first recall while retaining its session. Reuse its exact text
+        // when available; /fork copies only the selected branch, so an empty fork may recall anew.
+        const saved = entries?.find(
+          (entry) =>
+            isRecall(entry) && typeof entry.content === "string" && entry.content.length > 0
+        );
+        if (!firstPrompt && !saved) return undefined;
+        const recall = await core.recallForPrompt(
+          prompt,
+          typeof saved?.content === "string" ? saved.content : undefined
+        );
+        diag(harness, "inject_ok", {
+          session: sessionId,
+          chars: stable.length + (recall?.length ?? 0),
+        });
+        // Pi persists this AFTER the user message and BEFORE any tool continuations. Its position
+        // never moves. In particular, do not add a context-tail roster: Anthropic caches that tail.
+        return recall
+          ? { message: { customType: RECALL_MESSAGE, content: recall, display: false } }
+          : undefined;
       }
-      reminders.delete(sessionId);
-      const prompt = event.prompt?.trim() ?? "";
       if (prompt) await core.onPrompt(sessionId, prompt);
-      if (harness === "pi" && event.systemPromptOptions?.sections) {
-        const output = prompt ? core.getPromptContext(sessionId) : undefined;
-        // Pi 1.4 persists every section change. Snapshot ONLY the tool guide, including across
-        // /reload: appendEntry is durable session state, not a model-visible message. The active
-        // branch (not all file entries) is authoritative when resuming or navigating the tree.
-        const saved = branch?.find((e) => e.type === "custom" && e.customType === GUIDANCE_ENTRY);
-        let stable = typeof saved?.data === "string" ? saved.data : guidance.get(sessionId);
-        if (stable === undefined) {
-          stable = core.getSystemGuidance();
-          if (stable !== undefined) appendEntry?.(GUIDANCE_ENTRY, stable);
-        }
-        if (stable !== undefined) {
-          guidance.set(sessionId, stable);
-          event.systemPromptOptions.sections.hindsight = stable;
-        }
-        if (output?.rosterContext) reminders.set(sessionId, output.rosterContext);
-        const chars = (stable?.length ?? 0) + (output?.context?.length ?? 0);
-        diag(harness, chars ? "inject_ok" : "inject_empty", { session: sessionId, chars });
-        // Returning a custom message stores the recall ONCE, keeping it visible on later turns
-        // (until normal compaction). A context-only recall would silently lose that property.
-        if (output?.recallContext) {
-          return {
-            message: {
-              customType: "hindsight-recall",
-              content: output.recallContext,
-              display: false,
-            },
-          };
-        }
-        return undefined;
-      }
       const injection = core.getInjection(sessionId);
       if (!injection) {
         diag(harness, "inject_empty", { session: sessionId });
@@ -234,21 +236,6 @@ export function createPiHooks(
       }
       return { systemPrompt: `${event.systemPrompt}\n\n${injection}` };
     },
-    context(event: { messages: PiMessage[] }, sessionId: string) {
-      const reminder = reminders.get(sessionId);
-      if (!reminder) return undefined;
-      // context transforms a request-local clone; this message never enters the session file.
-      // Keep it through tool continuations/retries in this run, then clear it at agent_end or
-      // the next before_agent_start. Do not consume it on the first context callback (retry loss).
-      const message = {
-        role: "custom",
-        customType: "hindsight-roster-refresh",
-        content: reminder,
-        display: false,
-        timestamp: Date.now(),
-      };
-      return { messages: [...event.messages, message] };
-    },
     /** `branch` is the session's entries (`sessionManager.getBranch()`): the event alone holds only
      *  the latest run, and writing that back replaced the session's earlier runs (#4963). */
     async agentEnd(
@@ -256,12 +243,14 @@ export function createPiHooks(
       sessionId: string,
       branch?: readonly PiEntry[]
     ): Promise<void> {
-      reminders.delete(sessionId);
       const turns = branch ? readPiEntries(branch) : readPiMessages(event.messages);
       if (turns.length) await core.onTranscript(sessionId, turns, true); // the run has ended
     },
     /** The host is exiting: the last agent_end's write-back is still in flight (#5081). */
-    sessionShutdown: () => core.flush(),
+    async sessionShutdown() {
+      await core.flush();
+      core.clearSessionState();
+    },
   };
 }
 
@@ -293,7 +282,8 @@ interface PiWorkspace {
  */
 export function createPiExtension(
   harness: string,
-  makeRuntime: (harness: string, repoPath: string) => RuntimeCore | undefined = createRuntime
+  makeRuntime: (harness: string, repoPath: string) => RuntimeCore | undefined = createRuntime,
+  piVersion?: string
 ): ExtensionFactory {
   return (pi) => {
     const launchDir = process.cwd();
@@ -308,9 +298,7 @@ export function createPiExtension(
       // before_agent_start awaits it via createPiHooks.
       const ws = core
         ? {
-            hooks: createPiHooks(core, harness, core.seedIfCold(dir), (type, data) =>
-              pi.appendEntry(type, data)
-            ),
+            hooks: createPiHooks(core, harness, core.seedIfCold(dir), piVersion),
             tools: core.toolSpecs(),
           }
         : null;
@@ -339,14 +327,10 @@ export function createPiExtension(
       at(ctx)?.hooks.beforeAgentStart(
         event,
         ctx.sessionManager.getSessionId(),
-        ctx.sessionManager.getBranch?.()
+        ctx.sessionManager.getBranch?.(),
+        ctx.sessionManager.getEntries?.()
       )
     );
-    if (harness === "pi") {
-      pi.on("context", (event, ctx) =>
-        at(ctx)?.hooks.context(event, ctx.sessionManager.getSessionId())
-      );
-    }
     pi.on("agent_end", async (event, ctx) =>
       at(ctx)?.hooks.agentEnd(
         event,

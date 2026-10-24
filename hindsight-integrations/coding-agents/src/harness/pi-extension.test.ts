@@ -7,7 +7,12 @@ describe("pi extension adapter", () => {
   it.each(["before", "after"])("preserves sections added %s memory injection", async (order) => {
     const core = {
       onPrompt: vi.fn(async () => {}),
+      getPromptContext: vi.fn(() => ({
+        pages: [],
+        recallContext: "<hindsight_memories>remember this</hindsight_memories>",
+      })),
       getInjection: vi.fn(() => "<hindsight_memories>remember this</hindsight_memories>"),
+      getSystemGuidance: vi.fn(() => "Stable tool guide"),
       onTranscript: vi.fn(async () => {}),
       flush: vi.fn(async () => {}),
     };
@@ -26,8 +31,10 @@ describe("pi extension adapter", () => {
     const prompt = result?.systemPrompt ?? Object.values(sections).join("\n\n");
     expect(prompt).toContain("You are pi.");
     expect(prompt).toContain("SECTION-MARKER");
-    expect(prompt).toContain("<hindsight_memories>remember this</hindsight_memories>");
-    expect(result).toBeUndefined();
+    expect(prompt).toContain("Stable tool guide");
+    expect(prompt).not.toContain("remember this");
+    expect(result?.systemPrompt).toBeUndefined();
+    expect(result?.message?.content).toBe("<hindsight_memories>remember this</hindsight_memories>");
   });
 
   it("recalls on each prompt and appends the injection to the system prompt", async () => {

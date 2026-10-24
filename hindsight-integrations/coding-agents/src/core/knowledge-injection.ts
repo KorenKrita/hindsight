@@ -115,6 +115,23 @@ function toolGuide(opts?: ToolGuideOpts): string {
   );
 }
 
+/** Pi diffs prompt sections into durable system messages. Keep its guide independent of page
+ *  counts/availability; recall and periodic roster updates travel in separate message channels. */
+export function buildStableKnowledgePreamble(opts?: ToolGuideOpts): string {
+  return (
+    "<hindsight_knowledge>\n" +
+    "This repository has a Hindsight memory + knowledge base (curated, continuously-updated pages plus the raw " +
+    "memory behind them). The tools below are registered, but you must actually CALL them at the right moments:\n" +
+    `${toolGuide(opts)}\n` +
+    "ALSO your correction tool: when you verify a Hindsight memory is wrong or stale, ingest a " +
+    '"Correction: <topic>" doc stating what memory claimed, what is true now, and the evidence — ' +
+    "newer facts supersede older ones.\n" +
+    "Knowledge pages evolve as Hindsight learns this repository. Search for relevant pages rather " +
+    "than assuming a fixed inventory; a new bank may not have pages yet.\n" +
+    "</hindsight_knowledge>"
+  );
+}
+
 /** SessionStart: teach the whole tool suite + when to use each, and list what pages exist. Empty-state aware. */
 export function buildKnowledgePreamble(pages: PageRef[], opts?: ToolGuideOpts): string {
   const body = pages.length ? indexLine(pages) : EMPTY_STATE;

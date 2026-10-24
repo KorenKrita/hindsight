@@ -216,6 +216,10 @@ async function reflectFallback(
 export interface HookOutput {
   /** The model-facing injection block, or undefined when there's nothing to inject. */
   context?: string;
+  /** Separate delivery channels for hosts with persistent system-prompt sections (Pi). The
+   *  combined context above remains unchanged for hook hosts and other persistent plugins. */
+  recallContext?: string;
+  rosterContext?: string;
   /** User-facing line(s) — set only on the reflect turn (its goal + result preview). */
   notice?: string;
   /** This session's knowledge-page roster, from the shared per-session cache. The SINGLE source
@@ -373,26 +377,25 @@ export async function buildHookOutput(args: {
     pages: { atTurn: stale ? turns : (cached.pages?.atTurn ?? turns), list: pages },
   } satisfies SessionCache);
 
-  const blocks: string[] = [];
   // Hook-injected context lands in the USER MESSAGE and persists in the transcript — unlike a
   // system prompt, it accumulates. The reflect block is injected exactly ONCE, the turn reflect
   // ran. No cadence re-injection: replaying the turn-1 synthesis at arbitrary later turns reads
   // as random noise once the session drifts, and the agent holds hindsight_reflect for a FRESH
   // pass if compaction or drift makes it need memory again.
-  if (reflectAnswer && reflectRanThisTurn) blocks.push(buildSystemInjection(reflectAnswer));
+  const recallContext =
+    reflectAnswer && reflectRanThisTurn ? buildSystemInjection(reflectAnswer) : undefined;
   // Knowledge pages are NOT auto-injected: the agent pulls them through
   // hindsight_search_knowledge_pages when a question warrants it — an unprompted injection on
   // every turn (even a plain "yes") read as phantom research. The roster below keeps the tool
   // and the page names in front of the agent.
-  if (cadence > 0 && turns % cadence === 0) {
-    blocks.push(
-      buildRosterRefresh(pages, {
-        reflectOnNewGoals: cfg.autoInject !== "reflect",
-        extra: cfg.toolGuideExtra,
-      })
-    );
-  }
-  const kept = blocks.filter(Boolean);
+  const rosterContext =
+    cadence > 0 && turns % cadence === 0
+      ? buildRosterRefresh(pages, {
+          reflectOnNewGoals: cfg.autoInject !== "reflect",
+          extra: cfg.toolGuideExtra,
+        })
+      : undefined;
+  const kept = [recallContext, rosterContext].filter(Boolean);
 
   // User-facing notice ONLY on a turn that actually ran a source (reflect, pages or recall),
   // showing its assigned goal and a preview of what came back. Ordinary turns stay silent — page
@@ -421,7 +424,13 @@ export async function buildHookOutput(args: {
     notice = `${brandWord()} · no memory this turn — see ${diagFilePath()}`;
   }
 
-  return { context: kept.length ? kept.join("\n\n") : undefined, notice, pages };
+  return {
+    context: kept.length ? kept.join("\n\n") : undefined,
+    recallContext,
+    rosterContext,
+    notice,
+    pages,
+  };
 }
 
 /** Run one hook invocation: stdin event in, (maybe) an injection object on stdout. */

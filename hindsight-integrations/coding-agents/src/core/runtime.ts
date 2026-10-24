@@ -22,7 +22,7 @@ import { DAEMON_WAIT_RETAIN_MS, DAEMON_WAIT_SESSION_START_MS, ensureDaemon } fro
 import { diag } from "./diag";
 import { describeError, log, setLogLevel } from "./log";
 import type { HindsightClient } from "./hindsight";
-import { buildKnowledgePreamble } from "./knowledge-injection";
+import { buildKnowledgePreamble, buildStableKnowledgePreamble } from "./knowledge-injection";
 import { buildKnowledgeTools, type ToolSpec } from "./knowledge-tools";
 import { buildPageTrigger } from "./missions";
 import { retainLiveSession, type TransportTurn } from "./chat";
@@ -31,7 +31,7 @@ import { memoryUsageCursorStore, recordUsage } from "./usage";
 import { buildRetainStamp } from "./retain-stamp";
 import { buildSessionStartContext } from "./session-start";
 import { syncCompanionSkill } from "./skill-sync";
-import { buildHookOutput } from "./hook";
+import { buildHookOutput, type HookOutput } from "./hook";
 import { sessionCacheFile, writeSessionCache } from "./session-cache";
 
 const HARNESS = "opencode";
@@ -40,6 +40,7 @@ const FLUSH_TIMEOUT_MS = 10_000;
 
 export class RuntimeCore {
   private readonly injection = new Map<string, string>(); // sessionId -> this turn's injection block
+  private readonly promptContext = new Map<string, HookOutput>();
   private readonly turnCount = new Map<string, number>(); // sessionId -> user-turn counter (cadence)
   private readonly sessionState = new Map<string, { startTs: string; retainedTurns: number }>();
   /** Live write-back cursors. In memory, unlike the hook harnesses': this host outlives the session. */
@@ -211,6 +212,23 @@ export class RuntimeCore {
     const block = blocks.filter(Boolean).join("\n\n");
     this.injection.set(sessionId, block);
     this.lastInjection = block; // for consumers that can't supply a sessionId (see getInjection)
+    // Pi separates once-only recall and request-local reminders from its stable system guide.
+    // Other hosts keep reading the identical combined block through getInjection.
+    this.promptContext.set(sessionId, output);
+  }
+
+  /** Unlike getInjection's legacy fallback, these channels must never cross session boundaries. */
+  getPromptContext(sessionId: string): HookOutput | undefined {
+    return this.promptContext.get(sessionId);
+  }
+
+  /** Stable guidance for hosts that persist system-section deltas, snapshotted by the adapter. */
+  getSystemGuidance(): string | undefined {
+    if (process.env.HINDSIGHT_DISABLE_HOOKS) return;
+    return buildStableKnowledgePreamble({
+      reflectOnNewGoals: this.cfg.autoInject !== "reflect",
+      extra: this.cfg.toolGuideExtra,
+    });
   }
 
   /**

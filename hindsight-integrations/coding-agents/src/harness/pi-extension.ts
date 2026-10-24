@@ -4,11 +4,12 @@
  * pi (`@earendil-works/pi-coding-agent`) loads extensions listed in `~/.pi/agent/settings.json`;
  * Prime Agent (PrimeIntellect) is a fork of pi and loads the same shape from
  * `~/.prime/agent/settings.json`. Both call an extension's default export with their `pi` API, and
- * both expose the identical surface this adapter needs: `before_agent_start` (recall +
- * system-prompt injection), `agent_end` (transcript write-back), and `registerTool` for the native
- * `hindsight_*` knowledge tools. So neither host needs an adapter of its own — they differ only in
- * which harness name they report, which selects the `harnesses.<name>` config section, feeds
- * `{harness}` bank templating, and keeps their sessions attributable in diagnostics separately.
+ * both expose `before_agent_start` (recall + prompt injection), `agent_end` (transcript write-back),
+ * and `registerTool` for the native `hindsight_*` knowledge tools. Modern Pi additionally uses
+ * `context` for request-local reminders and session entries to freeze its system guide across
+ * reloads; Prime Agent and older Pi keep their original combined system-prompt injection. The
+ * harness name also selects `harnesses.<name>` config, feeds `{harness}` bank templating, and keeps
+ * sessions attributable in diagnostics separately.
  *
  * The memory behaviour itself stays in RuntimeCore — the same reflect-and-inject core every
  * Hindsight harness uses; this file only adapts the pi extension API at its boundary.
@@ -26,8 +27,9 @@ import { type PiEntry, type PiMessage, readPiEntries, readPiMessages } from "../
 
 interface BeforeAgentStartEvent {
   type: "before_agent_start";
-  /** The raw user prompt text. */
-  prompt: string;
+  /** Custom-message runs have no user prompt (Pi >= 1.2.0). */
+  messageType?: "user" | "custom";
+  prompt?: string;
   /** The fully assembled system prompt for this turn. */
   systemPrompt: string;
   /** Present on hosts that compose the prompt from extension sections. */
@@ -42,13 +44,21 @@ interface AgentEndEvent {
 
 interface BeforeAgentStartResult {
   systemPrompt?: string;
+  message?: { customType: string; content: string; display: boolean };
 }
+
+interface PiSessionEntry extends PiEntry {
+  customType?: string;
+  data?: unknown;
+}
+
+const GUIDANCE_ENTRY = "hindsight-system-guidance";
 
 interface SessionManagerLike {
   getSessionId(): string;
   /** Every entry from the session root to the current leaf, already holding this run's messages
    *  when `agent_end` fires. Optional: a host without it falls back to the event's messages. */
-  getBranch?(): readonly PiEntry[];
+  getBranch?(): readonly PiSessionEntry[];
 }
 
 /** Only what this adapter reads. Both hosts also expose a UI notifier, but the seed banner it would
@@ -91,7 +101,15 @@ interface ExtensionAPI {
     event: "agent_end",
     handler: (event: AgentEndEvent, ctx: ExtensionContext) => Promise<void> | void
   ): void;
+  on(
+    event: "context",
+    handler: (
+      event: { messages: PiMessage[] },
+      ctx: ExtensionContext
+    ) => { messages: PiMessage[] } | undefined
+  ): void;
   on(event: "session_shutdown", handler: () => Promise<void> | void): void;
+  appendEntry(customType: string, data: unknown): void;
   registerTool(definition: ToolDefinition): void;
 }
 
@@ -138,15 +156,27 @@ export function toPiTool(
  * calls Hindsight directly.
  */
 export function createPiHooks(
-  core: Pick<RuntimeCore, "onPrompt" | "getInjection" | "onTranscript" | "flush">,
+  core: Pick<
+    RuntimeCore,
+    | "onPrompt"
+    | "getInjection"
+    | "getSystemGuidance"
+    | "getPromptContext"
+    | "onTranscript"
+    | "flush"
+  >,
   harness: string,
-  sessionStart?: Promise<void>
+  sessionStart?: Promise<void>,
+  appendEntry?: ExtensionAPI["appendEntry"]
 ) {
   let sessionStartAwaited = false;
+  const guidance = new Map<string, string>();
+  const reminders = new Map<string, string>();
   return {
     async beforeAgentStart(
       event: Omit<BeforeAgentStartEvent, "type">,
-      sessionId: string
+      sessionId: string,
+      branch?: readonly PiSessionEntry[]
     ): Promise<BeforeAgentStartResult | undefined> {
       if (!sessionStartAwaited) {
         sessionStartAwaited = true;
@@ -155,8 +185,40 @@ export function createPiHooks(
         // before it has any knowledge (mirrors the other harnesses).
         await sessionStart;
       }
-      const prompt = event.prompt.trim();
+      reminders.delete(sessionId);
+      const prompt = event.prompt?.trim() ?? "";
       if (prompt) await core.onPrompt(sessionId, prompt);
+      if (harness === "pi" && event.systemPromptOptions?.sections) {
+        const output = prompt ? core.getPromptContext(sessionId) : undefined;
+        // Pi 1.4 persists every section change. Snapshot ONLY the tool guide, including across
+        // /reload: appendEntry is durable session state, not a model-visible message. The active
+        // branch (not all file entries) is authoritative when resuming or navigating the tree.
+        const saved = branch?.find((e) => e.type === "custom" && e.customType === GUIDANCE_ENTRY);
+        let stable = typeof saved?.data === "string" ? saved.data : guidance.get(sessionId);
+        if (stable === undefined) {
+          stable = core.getSystemGuidance();
+          if (stable !== undefined) appendEntry?.(GUIDANCE_ENTRY, stable);
+        }
+        if (stable !== undefined) {
+          guidance.set(sessionId, stable);
+          event.systemPromptOptions.sections.hindsight = stable;
+        }
+        if (output?.rosterContext) reminders.set(sessionId, output.rosterContext);
+        const chars = (stable?.length ?? 0) + (output?.context?.length ?? 0);
+        diag(harness, chars ? "inject_ok" : "inject_empty", { session: sessionId, chars });
+        // Returning a custom message stores the recall ONCE, keeping it visible on later turns
+        // (until normal compaction). A context-only recall would silently lose that property.
+        if (output?.recallContext) {
+          return {
+            message: {
+              customType: "hindsight-recall",
+              content: output.recallContext,
+              display: false,
+            },
+          };
+        }
+        return undefined;
+      }
       const injection = core.getInjection(sessionId);
       if (!injection) {
         diag(harness, "inject_empty", { session: sessionId });
@@ -172,6 +234,21 @@ export function createPiHooks(
       }
       return { systemPrompt: `${event.systemPrompt}\n\n${injection}` };
     },
+    context(event: { messages: PiMessage[] }, sessionId: string) {
+      const reminder = reminders.get(sessionId);
+      if (!reminder) return undefined;
+      // context transforms a request-local clone; this message never enters the session file.
+      // Keep it through tool continuations/retries in this run, then clear it at agent_end or
+      // the next before_agent_start. Do not consume it on the first context callback (retry loss).
+      const message = {
+        role: "custom",
+        customType: "hindsight-roster-refresh",
+        content: reminder,
+        display: false,
+        timestamp: Date.now(),
+      };
+      return { messages: [...event.messages, message] };
+    },
     /** `branch` is the session's entries (`sessionManager.getBranch()`): the event alone holds only
      *  the latest run, and writing that back replaced the session's earlier runs (#4963). */
     async agentEnd(
@@ -179,6 +256,7 @@ export function createPiHooks(
       sessionId: string,
       branch?: readonly PiEntry[]
     ): Promise<void> {
+      reminders.delete(sessionId);
       const turns = branch ? readPiEntries(branch) : readPiMessages(event.messages);
       if (turns.length) await core.onTranscript(sessionId, turns, true); // the run has ended
     },
@@ -229,7 +307,12 @@ export function createPiExtension(
       // Fire-and-forget cold seed (bank check + background git seed); the workspace's first
       // before_agent_start awaits it via createPiHooks.
       const ws = core
-        ? { hooks: createPiHooks(core, harness, core.seedIfCold(dir)), tools: core.toolSpecs() }
+        ? {
+            hooks: createPiHooks(core, harness, core.seedIfCold(dir), (type, data) =>
+              pi.appendEntry(type, data)
+            ),
+            tools: core.toolSpecs(),
+          }
         : null;
       workspaces.set(dir, ws);
       return ws ?? undefined;
@@ -253,8 +336,17 @@ export function createPiExtension(
       at(ctx);
     });
     pi.on("before_agent_start", async (event, ctx) =>
-      at(ctx)?.hooks.beforeAgentStart(event, ctx.sessionManager.getSessionId())
+      at(ctx)?.hooks.beforeAgentStart(
+        event,
+        ctx.sessionManager.getSessionId(),
+        ctx.sessionManager.getBranch?.()
+      )
     );
+    if (harness === "pi") {
+      pi.on("context", (event, ctx) =>
+        at(ctx)?.hooks.context(event, ctx.sessionManager.getSessionId())
+      );
+    }
     pi.on("agent_end", async (event, ctx) =>
       at(ctx)?.hooks.agentEnd(
         event,

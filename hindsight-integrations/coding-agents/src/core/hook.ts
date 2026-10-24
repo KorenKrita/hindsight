@@ -102,12 +102,12 @@ interface HookClient {
 /** How many turns auto-inject may FAIL on before a session gives up on memory. The budget is
  *  turns, not time: each retry costs another full attempt (up to `reflectTimeoutMs` on the
  *  reflect path), so a dead server spends this many turns before every later turn is free. */
-const HOOK_INJECT_ATTEMPTS = 2;
+export const HOOK_INJECT_ATTEMPTS = 2;
 
 /** How many turns a pages/recall source may come back EMPTY on before the session stops asking.
  *  Larger than the failure budget: an empty retrieval is cheap (no LLM), and its query is the
  *  current prompt, so an opener like "hi" matching nothing says nothing about the real question. */
-const HOOK_INJECT_EMPTY_ATTEMPTS = 5;
+export const HOOK_INJECT_EMPTY_ATTEMPTS = 5;
 
 /**
  * What to cache for a once-per-session auto-injection, given what the source returned.
@@ -213,6 +213,15 @@ async function reflectFallback(
   );
 }
 
+/** Optional process-local attempt state for hosts whose transcript owns successful delivery.
+ *  No page inventory or recalled body needs to survive here once that host persists its message. */
+export interface HookInjectionState {
+  reflectAnswer?: string;
+  reflectAttempts?: number;
+  deferInitialReflect?: boolean;
+  retryLimit?: number;
+}
+
 export interface HookOutput {
   /** The model-facing injection block, or undefined when there's nothing to inject. */
   context?: string;
@@ -242,10 +251,13 @@ export async function buildHookOutput(args: {
   client: HookClient;
   /** Omit for one stateless attempt (Pi uses its branch, not a temp cache, as delivery state). */
   cacheFile?: string;
+  /** Mutable attempt state instead of a temp file (Pi); omitted by existing hook callers. */
+  injectionState?: HookInjectionState;
 }): Promise<HookOutput> {
   const { harness, prompt, cfg, client, cacheFile } = args;
 
-  const cached: SessionCache = cacheFile ? readSessionCache(cacheFile) : {};
+  const cached: SessionCache =
+    args.injectionState ?? (cacheFile ? readSessionCache(cacheFile) : {});
   const turns = (cached.turns ?? 0) + 1;
 
   // ── auto-inject: once per session, on the first prompt ────────────────────────
@@ -375,6 +387,17 @@ export async function buildHookOutput(args: {
     }
   }
 
+  if (args.injectionState) {
+    Object.assign(args.injectionState, {
+      reflectAnswer,
+      reflectAttempts,
+      deferInitialReflect: false,
+      retryLimit:
+        reflectFailed || cfg.autoInject === "reflect"
+          ? HOOK_INJECT_ATTEMPTS
+          : HOOK_INJECT_EMPTY_ATTEMPTS,
+    });
+  }
   if (cacheFile) {
     writeSessionCache(cacheFile, {
       turns,

@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { resolveConfig, type RawConfig } from "../core/config";
-import type { HindsightClient } from "../core/hindsight";
+import { ReflectError, type HindsightClient } from "../core/hindsight";
+import * as diagnostics from "../core/diag";
+import { log } from "../core/log";
 import { RuntimeCore } from "../core/runtime";
 import * as sessionCache from "../core/session-cache";
 import { createPiExtension, usesStablePiContext } from "./pi-extension";
@@ -14,6 +16,8 @@ interface Message {
   timestamp?: number;
 }
 interface Entry {
+  id?: string;
+  parentId?: string | null;
   type: string;
   customType?: string;
   content?: string;
@@ -42,6 +46,8 @@ function session(copy: Entry[] = []) {
   };
   rebuild();
   const append = (e: Entry) => {
+    e.id ??= randomUUID();
+    e.parentId = branch.at(-1)?.id ?? null;
     branch.push(e);
     entries.push(e);
     rebuild();
@@ -246,7 +252,7 @@ describe("Pi stable system section", () => {
     }
   });
 
-  it("restores a discarded first recall from the session tree, even after reload", async () => {
+  it("retrieves for an edited opening goal after tree rewind and reload", async () => {
     const f = fixture();
     const a = session();
     await f.prompt(a, "original goal");
@@ -255,13 +261,14 @@ describe("Pi stable system section", () => {
     await f.reload();
     await f.prompt(a, "edited goal");
     expect(recalls(a)).toHaveLength(1);
-    expect(recalls(a)[0].content).toBe(content);
-    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(1);
+    expect(recalls(a)[0].content).not.toBe(content);
+    expect(recalls(a)[0].content).toContain("PAGE-HIT:edited goal");
+    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(2);
     // A /fork at the same point copies only that branch, not the abandoned recall. Re-query once.
     const fork = session(a.branch.slice(0, 1));
     await f.prompt(fork, "forked goal");
     expect(recalls(fork)[0].content).toContain("PAGE-HIT:forked goal");
-    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(2);
+    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(3);
   });
 
   it("recovers a missing recall after the first user node, but does not inject into unrelated old history", async () => {
@@ -271,7 +278,14 @@ describe("Pi stable system section", () => {
     a.rewind(2); // SDK branch retaining the user but not its following recall
     await f.prompt(a);
     expect(recalls(a)).toHaveLength(1);
-    const old = session([{ type: "message", message: { role: "user", content: "old prompt" } }]);
+    const old = session(
+      Array.from({ length: 5 }, () => ({
+        id: randomUUID(),
+        type: "message",
+        message: { role: "user", content: "old prompt" },
+      }))
+    );
+    old.entries.push(...a.entries); // unrelated saved recall must not bypass the history budget
     await f.prompt(old);
     expect(recalls(old)).toHaveLength(0);
     expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(1);
@@ -311,7 +325,7 @@ describe("Pi stable system section", () => {
   );
 
   it.each(["empty", "failure"])(
-    "does not retry an %s opening retrieval on later prompts; a fresh branch may try again",
+    "retries an %s opening retrieval on the next prompt after reload",
     async (outcome) => {
       const f = fixture();
       const a = session();
@@ -320,13 +334,159 @@ describe("Pi stable system section", () => {
       await f.prompt(a);
       await f.reload();
       await f.prompt(a);
-      expect(recalls(a)).toHaveLength(0);
-      expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(1);
-      a.rewind(1);
-      await f.prompt(a);
       expect(recalls(a)).toHaveLength(1);
+      expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(2);
+      expect(recalls(a)[0].parentId).toBe(a.branch.filter((e) => e.message?.role === "user")[1].id);
+      await f.prompt(a);
+      expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(2);
     }
   );
+
+  it.each(["pages", "recall"] as const)(
+    "bounds empty %s retrievals to five user turns",
+    async (autoInject) => {
+      const f = fixture({ autoInject });
+      f.client.searchKnowledgePages.mockResolvedValue([]);
+      f.client.recallObservations.mockResolvedValue([]);
+      const a = session();
+      for (let turn = 1; turn <= 8; turn++) {
+        if (turn === 3 || turn === 6) await f.reload();
+        await f.prompt(a, `turn ${turn}`);
+      }
+      const source =
+        autoInject === "pages" ? f.client.searchKnowledgePages : f.client.recallObservations;
+      expect(source).toHaveBeenCalledTimes(5);
+      expect(recalls(a)).toHaveLength(0);
+    }
+  );
+
+  it.each(["pages", "recall", "reflect"] as const)(
+    "bounds failed %s retrievals to two attempts",
+    async (autoInject) => {
+      const f = fixture({ autoInject });
+      f.client.searchKnowledgePages.mockRejectedValue(new Error("offline"));
+      f.client.recallObservations.mockRejectedValue(new Error("offline"));
+      f.client.reflect.mockRejectedValue(new Error("offline"));
+      const a = session();
+      for (let i = 0; i < 8; i++) await f.prompt(a);
+      const source =
+        autoInject === "pages"
+          ? f.client.searchKnowledgePages
+          : autoInject === "recall"
+            ? f.client.recallObservations
+            : f.client.reflect;
+      expect(source).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it.each([undefined, 503])(
+    "retries reflect timeout/5xx (%s), then persists a fallback exactly once",
+    async (status) => {
+      const f = fixture({ autoInject: "reflect" });
+      f.client.reflect.mockRejectedValue(
+        new ReflectError("unavailable", status, status === undefined)
+      );
+      f.client.searchKnowledgePages.mockResolvedValueOnce([]);
+      f.client.recallObservations.mockResolvedValueOnce([]);
+      const a = session();
+      await f.prompt(a);
+      expect(recalls(a)).toHaveLength(0);
+      await f.prompt(a, "real goal");
+      await f.prompt(a);
+      expect(f.client.reflect).toHaveBeenCalledTimes(2);
+      expect(recalls(a)[0].content).toContain("PAGE-HIT:real goal");
+    }
+  );
+
+  it.each(["empty", "permanent"])("stops immediately after reflect %s", async (outcome) => {
+    const f = fixture({ autoInject: "reflect" });
+    if (outcome === "empty") f.client.reflect.mockResolvedValue("");
+    else f.client.reflect.mockRejectedValue(new ReflectError("unauthorized", 401, false));
+    const a = session();
+    for (let i = 0; i < 6; i++) await f.prompt(a);
+    expect(f.client.reflect).toHaveBeenCalledTimes(1);
+    expect(f.client.searchKnowledgePages).not.toHaveBeenCalled();
+  });
+
+  it("allows at most one more failed retrieval after losing process state, never after five user turns", async () => {
+    const f = fixture();
+    f.client.searchKnowledgePages.mockRejectedValue(new Error("offline"));
+    const a = session();
+    await f.prompt(a);
+    await f.prompt(a);
+    await f.reload();
+    for (let i = 0; i < 6; i++) await f.prompt(a);
+    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(3);
+    await f.reload();
+    await f.prompt(a);
+    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(["pages", "reflect"] as const)(
+    "consumes cold-start defer for %s, then retries with a stable prefix",
+    async (autoInject) => {
+      const f = fixture({ autoInject });
+      // The seed is isolated; exercise the real RuntimeCore's handoff of its cold-bank decision.
+      Object.assign(f.host.core, { deferInitialReflect: true });
+      const a = session();
+      await f.prompt(a, "turn 1");
+      expect(f.client.searchKnowledgePages).not.toHaveBeenCalled();
+      expect(f.client.reflect).not.toHaveBeenCalled();
+      expect(recalls(a)).toHaveLength(0);
+      const previous = f.request(a);
+      await f.prompt(a, "turn 2");
+      expect(f.request(a).slice(0, previous.length)).toEqual(previous);
+      expect(recalls(a)).toHaveLength(1);
+      expect((f.host.core as unknown as { deferInitialReflect: boolean }).deferInitialReflect).toBe(
+        false
+      );
+    }
+  );
+
+  it("logs reflect goal notices and inject_empty without changing the stable section", async () => {
+    const f = fixture();
+    const info = vi.spyOn(log, "info");
+    const diag = vi.spyOn(diagnostics, "diag");
+    const a = session();
+    f.client.searchKnowledgePages.mockResolvedValueOnce([]);
+    await f.prompt(a);
+    expect(diag).toHaveBeenCalledWith("pi", "inject_empty", { session: a.id });
+    await f.prompt(a, "real goal");
+    expect(info).toHaveBeenCalledWith("pi", "reflect goal", { preview: expect.any(String) });
+  });
+
+  it("logs the rejected version only once per workspace", async () => {
+    const diag = vi.spyOn(diagnostics, "diag");
+    const f = fixture({}, "1.3.9");
+    const a = session();
+    await f.prompt(a);
+    await f.prompt(a);
+    expect(diag.mock.calls.filter((c) => c[1] === "stable_context_disabled")).toEqual([
+      ["pi", "stable_context_disabled", { version: "1.3.9" }],
+    ]);
+  });
+
+  it("does not let a failed sibling stop an edited opening goal", async () => {
+    const f = fixture({ autoInject: "reflect" });
+    f.client.reflect.mockResolvedValueOnce("");
+    const a = session();
+    await f.prompt(a, "original goal");
+    a.rewind(1);
+    await f.prompt(a, "edited goal");
+    expect(f.client.reflect).toHaveBeenCalledTimes(2);
+    expect(recalls(a)).toHaveLength(1);
+  });
+
+  it("does not reuse a saved recall at a later user turn even if its original user survives", async () => {
+    const f = fixture();
+    const a = session();
+    await f.prompt(a, "original goal");
+    a.rewind(2);
+    a.append({ type: "message", message: { role: "user", content: "another branch goal" } });
+    await f.prompt(a, "current goal");
+    expect(recalls(a)[0].content).toContain("PAGE-HIT:current goal");
+    expect(f.client.searchKnowledgePages).toHaveBeenCalledTimes(2);
+  });
 
   it("honors a later autoInject=none even when an abandoned branch has a saved recall", async () => {
     const f = fixture();
@@ -377,29 +537,38 @@ describe("Pi stable system section", () => {
     expect(out.result).toBeUndefined();
   });
 
-  it.each([undefined, "", "1.4.0-beta", "0.87.1", "1.3.99"])(
-    "fails closed for version %s",
-    (version) => {
-      expect(usesStablePiContext(version)).toBe(false);
-    }
-  );
-  it.each(["1.4.0", "1.4.1", "1.14.0", "2.0.0", "1.4.0+bolt"])("accepts version %s", (version) => {
+  it.each([undefined, "", "1.4", "0.87.1", "1.3.99"])("fails closed for version %s", (version) => {
+    expect(usesStablePiContext(version)).toBe(false);
+  });
+  it.each([
+    "1.4.0",
+    "1.4.1",
+    "1.14.0",
+    "2.0.0",
+    "1.4.0+bolt",
+    "v1.4.0",
+    "1.4.0-rc.1",
+    "v1.4.0-beta+bolt",
+  ])("accepts version %s", (version) => {
     expect(usesStablePiContext(version)).toBe(true);
   });
 
-  it("releases runtime session tables on session_shutdown (also emitted by Pi on switch/reload)", async () => {
-    const f = fixture({}, "0.87.1");
+  it("preserves bounded legacy counters across shutdown and same-process resume", async () => {
+    const f = fixture({ pageRefreshEveryTurns: 20 }, "0.87.1");
     const a = session();
     await f.prompt(a);
     expect(f.host.core.getInjection(a.id)).toBeTruthy();
     const old = f.host;
-    await f.reload();
+    await old.handlers.session_shutdown();
     expect(old.clear).toHaveBeenCalledOnce();
     expect(old.core.getInjection(a.id)).toBeFalsy();
+    const resumed = await f.prompt(a);
+    expect(resumed.sections.hindsight).toBeUndefined();
+    for (let i = 0; i < 300; i++) await old.core.onPrompt(`bounded-${i}`, "hello");
     expect(
       Object.values(old.core)
         .filter((v) => v instanceof Map)
-        .every((v) => v.size === 0)
+        .every((v) => v.size <= 256)
     ).toBe(true);
   });
 

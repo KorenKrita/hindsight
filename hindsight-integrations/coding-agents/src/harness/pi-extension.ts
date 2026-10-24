@@ -48,6 +48,8 @@ interface BeforeAgentStartResult {
 }
 
 interface PiSessionEntry extends PiEntry {
+  id?: string;
+  parentId?: string | null;
   customType?: string;
   content?: unknown;
 }
@@ -57,7 +59,7 @@ const RECALL_MESSAGE = "hindsight-recall";
 /** Sections/durable diffs exist since Pi 0.86.0, but this delivery policy is only for 1.4+.
  *  Unknown versions fail closed to the legacy path, not a guess based on an event field. */
 export function usesStablePiContext(version: string | undefined): boolean {
-  const match = version?.match(/^(\d+)\.(\d+)\.(\d+)(?:\+[^\s]+)?$/);
+  const match = version?.match(/^v?(\d+)\.(\d+)\.(\d+)(?:-[\w.-]+)?(?:\+[\w.-]+)?$/);
   return !!match && (+match[1] > 1 || (+match[1] === 1 && +match[2] >= 4));
 }
 
@@ -175,6 +177,9 @@ export function createPiHooks(
   sessionStart?: Promise<void>,
   piVersion?: string
 ) {
+  if (harness === "pi" && !usesStablePiContext(piVersion)) {
+    diag(harness, "stable_context_disabled", { version: piVersion ?? "unknown" });
+  }
   return {
     async beforeAgentStart(
       event: Omit<BeforeAgentStartEvent, "type">,
@@ -196,24 +201,41 @@ export function createPiHooks(
         // compacted entries too, so compaction must not revive an already delivered recall.
         // Without a branch we cannot safely decide: keep the guide, but do not risk duplication.
         if (!stable || !prompt || !branch || branch.some(isRecall)) return undefined;
-        const firstPrompt = !branch.some(
+        const users = branch.filter(
           (entry) => entry.type === "message" && entry.message?.role === "user"
         );
-        // /tree can discard the first recall while retaining its session. Reuse its exact text
-        // when available; /fork copies only the selected branch, so an empty fork may recall anew.
-        const saved = entries?.find(
-          (entry) =>
-            isRecall(entry) && typeof entry.content === "string" && entry.content.length > 0
-        );
-        if (!firstPrompt && !saved) return undefined;
-        const recall = await core.recallForPrompt(
-          prompt,
-          typeof saved?.content === "string" ? saved.content : undefined
-        );
-        diag(harness, "inject_ok", {
-          session: sessionId,
-          chars: stable.length + (recall?.length ?? 0),
+        // Only the opening user node retained by a tree rewind may recover its own result.
+        // An edited opener/sibling or later turn must query its CURRENT goal, never another branch.
+        const openingUser =
+          users.length === 1 && branch.at(-1)?.id === users[0].id ? users[0] : undefined;
+        const saved = openingUser?.id
+          ? entries?.find(
+              (entry) =>
+                isRecall(entry) &&
+                entry.parentId === openingUser.id &&
+                typeof entry.content === "string" &&
+                entry.content.length > 0
+            )
+          : undefined;
+        const recall = await core.recallForPrompt(prompt, {
+          sessionId,
+          users: users.map((entry) => {
+            const content = entry.message?.content;
+            const text =
+              typeof content === "string"
+                ? content
+                : Array.isArray(content)
+                  ? content
+                      .filter((b) => b?.type === "text" && typeof b.text === "string")
+                      .map((b) => b.text)
+                      .join("\n")
+                  : "";
+            return { id: entry.id, text: text.trim() };
+          }),
+          saved: typeof saved?.content === "string" ? saved.content : undefined,
         });
+        if (recall) diag(harness, "inject_ok", { session: sessionId, chars: recall.length });
+        else diag(harness, "inject_empty", { session: sessionId });
         // Pi persists this AFTER the user message and BEFORE any tool continuations. Its position
         // never moves. In particular, do not add a context-tail roster: Anthropic caches that tail.
         return recall

@@ -31,14 +31,41 @@ import { memoryUsageCursorStore, recordUsage } from "./usage";
 import { buildRetainStamp } from "./retain-stamp";
 import { buildSessionStartContext } from "./session-start";
 import { syncCompanionSkill } from "./skill-sync";
-import { buildHookOutput } from "./hook";
+import {
+  buildHookOutput,
+  HOOK_INJECT_ATTEMPTS,
+  HOOK_INJECT_EMPTY_ATTEMPTS,
+  type HookInjectionState,
+} from "./hook";
 import { sessionCacheFile, writeSessionCache } from "./session-cache";
 
 const HARNESS = "opencode";
 /** How long `flush` holds a host's exit for in-flight write-backs: room for one retain request. */
 const FLUSH_TIMEOUT_MS = 10_000;
+const SESSION_STATE_LIMIT = 256;
+
+/** Preserve recent legacy sessions across /resume without unbounded process-lifetime tables. */
+function rememberSession<T>(map: Map<string, T>, key: string, value: T): void {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > SESSION_STATE_LIMIT) map.delete(map.keys().next().value!);
+}
+
+export interface RecallBranch {
+  sessionId: string;
+  /** Only user nodes, before Pi appends the current prompt. IDs distinguish tree branches. */
+  users: readonly { id?: string; text: string }[];
+  saved?: string;
+}
+
+interface RecallAttempt {
+  userIds: (string | undefined)[];
+  prompt: string;
+  state: HookInjectionState;
+}
 
 export class RuntimeCore {
+  private readonly recallAttempts = new Map<string, RecallAttempt>();
   private readonly injection = new Map<string, string>(); // sessionId -> this turn's injection block
   private readonly turnCount = new Map<string, number>(); // sessionId -> user-turn counter (cadence)
   private readonly sessionState = new Map<string, { startTs: string; retainedTurns: number }>();
@@ -169,7 +196,7 @@ export class RuntimeCore {
     if (process.env.HINDSIGHT_DISABLE_HOOKS) return; // anti-recursion (see seedIfCold)
     if (!sessionId || !prompt.trim()) return;
     const turns = (this.turnCount.get(sessionId) ?? 0) + 1;
-    this.turnCount.set(sessionId, turns);
+    rememberSession(this.turnCount, sessionId, turns);
 
     const cacheFile = sessionCacheFile(this.harness, sessionId);
     if (this.deferInitialReflect) {
@@ -209,24 +236,65 @@ export class RuntimeCore {
       this.notify?.("Hindsight · recalled past decisions", preview);
     }
     const block = blocks.filter(Boolean).join("\n\n");
-    this.injection.set(sessionId, block);
+    rememberSession(this.injection, sessionId, block);
     this.lastInjection = block; // for consumers that can't supply a sessionId (see getInjection)
   }
 
-  /** Pi 1.4+ calls this only when its branch needs the opening recall. No /tmp state, turn
-   *  counters, roster cadence, or cold-seed marker may decide whether that branch has memory.
-   *  An empty/failed first attempt is not retried on later prompts; explicit tools remain available. */
-  async recallForPrompt(prompt: string, saved?: string): Promise<string | undefined> {
+  /** Pi owns delivery in its branch, not in /tmp or this retry table. Only failed/empty attempts
+   *  live here; the user count also bounds retries after reload and on unrelated old branches. */
+  async recallForPrompt(prompt: string, branch: RecallBranch): Promise<string | undefined> {
     if (process.env.HINDSIGHT_DISABLE_HOOKS || !prompt.trim() || this.cfg.autoInject === "none")
       return;
+    const { sessionId, users, saved } = branch;
     if (saved) return saved;
+    const userCount = users.length;
+    if (userCount >= HOOK_INJECT_EMPTY_ATTEMPTS) return;
+    const previous = this.recallAttempts.get(sessionId);
+    // before_agent_start precedes the new user ID. Match the old ancestor IDs AND the prompt
+    // that was subsequently persisted; a rewind/edited sibling must not inherit a terminal result.
+    const followsPrevious =
+      previous &&
+      previous.userIds.length <= userCount &&
+      previous.userIds.every((id, i) => id !== undefined && id === users[i].id) &&
+      (userCount === previous.userIds.length ? prompt : users[previous.userIds.length].text) ===
+        previous.prompt;
+    const state: HookInjectionState = followsPrevious
+      ? previous.state
+      : {
+          reflectAttempts: userCount,
+          retryLimit:
+            this.cfg.autoInject === "reflect" ? HOOK_INJECT_ATTEMPTS : HOOK_INJECT_EMPTY_ATTEMPTS,
+        };
+    const limit = state.retryLimit ?? HOOK_INJECT_EMPTY_ATTEMPTS;
+    if (
+      state.reflectAnswer !== undefined ||
+      userCount >= limit ||
+      (state.reflectAttempts ?? 0) >= limit
+    )
+      return;
+    if (this.deferInitialReflect) {
+      this.deferInitialReflect = false;
+      state.deferInitialReflect = userCount === 0;
+    }
+    rememberSession(this.recallAttempts, sessionId, {
+      userIds: users.map((u) => u.id),
+      prompt,
+      state,
+    });
     const output = await buildHookOutput({
       harness: this.harness,
       prompt,
       cfg: { ...this.cfg, pageRefreshEveryTurns: 0 },
       client: this.client,
+      injectionState: state,
     });
+    if (output.notice) {
+      const preview = output.notice.replace(/\s+/g, " ").trim().slice(0, 140);
+      log.info(this.harness, "reflect goal", { preview });
+    }
     if (!output.recallContext) return;
+    // A successful in-process attempt is NOT evidence that any branch received it.
+    this.recallAttempts.delete(sessionId);
     const inventory = output.pagesKnown
       ? `\n\n<hindsight_knowledge_inventory>\nAt this opening recall, the repository has ${output.pages.length} knowledge ${output.pages.length === 1 ? "page" : "pages"}. Use hindsight_list_knowledge_pages for the current inventory.\n</hindsight_knowledge_inventory>`
       : "";
@@ -341,8 +409,8 @@ export class RuntimeCore {
     let st = this.sessionState.get(sessionId);
     if (!st) {
       st = { startTs: new Date().toISOString(), retainedTurns: 0 };
-      this.sessionState.set(sessionId, st);
     }
+    rememberSession(this.sessionState, sessionId, st);
     return st;
   }
 
@@ -364,12 +432,11 @@ export class RuntimeCore {
     clearTimeout(timer);
   }
 
-  /** Pi emits session_shutdown on exit, reload, /new, /resume and /fork. Release all session
-   *  tables, including legacy delivery state; the persisted transcript remains authoritative. */
+  /** Shutdown also fires on session switches. Keep bounded legacy counters/timestamps: clearing
+   *  them would inject the first-turn preamble again on same-process /resume. */
   clearSessionState(): void {
     this.injection.clear();
-    this.turnCount.clear();
-    this.sessionState.clear();
+    this.recallAttempts.clear();
     this.lastInjection = "";
     this.cursors = memoryCursorStore();
     this.usageCursors = memoryUsageCursorStore();

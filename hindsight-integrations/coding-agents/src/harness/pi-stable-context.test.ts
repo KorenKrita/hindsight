@@ -525,16 +525,20 @@ describe("Pi stable system section", () => {
     async (version) => {
       const f = fixture({}, version);
       const out = await f.prompt(session());
-      expect(out.sections.hindsight).toContain("PAGE-HIT");
-      expect(out.result).toBeUndefined();
+      // Legacy hosts take the combined block as a hidden user-turn message, never a section (#6053).
+      expect(out.sections.hindsight).toBeUndefined();
+      expect(out.result?.message).toMatchObject({ customType: "hindsight", display: false });
+      expect(out.result?.message?.content).toContain("PAGE-HIT");
     }
   );
 
   it("keeps Prime Agent on the legacy path even with a modern version and sections", async () => {
     const f = fixture({}, "1.4.0", "prime-agent");
     const out = await f.prompt(session());
-    expect(out.sections.hindsight).toContain("PAGE-HIT");
-    expect(out.result).toBeUndefined();
+    // Legacy hosts take the combined block as a hidden user-turn message, never a section (#6053).
+    expect(out.sections.hindsight).toBeUndefined();
+    expect(out.result?.message).toMatchObject({ customType: "hindsight", display: false });
+    expect(out.result?.message?.content).toContain("PAGE-HIT");
   });
 
   it.each([undefined, "", "1.4", "0.87.1", "1.3.99"])("fails closed for version %s", (version) => {

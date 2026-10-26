@@ -4,10 +4,10 @@
  * pi (`@earendil-works/pi-coding-agent`) loads extensions listed in `~/.pi/agent/settings.json`;
  * Prime Agent (PrimeIntellect) is a fork of pi and loads the same shape from
  * `~/.prime/agent/settings.json`. Both call an extension's default export with their `pi` API, and
- * both expose `before_agent_start` (recall + prompt injection), `agent_end` (transcript write-back),
- * and `registerTool` for the native `hindsight_*` knowledge tools. Pi 1.4+ uses a config-only system
- * guide and a once-per-branch persistent recall message, never request-local tail messages;
- * Prime Agent and older Pi keep their original combined system-prompt injection. The
+ * both expose `before_agent_start` (recall + user-turn injection), `agent_end` (transcript
+ * write-back), and `registerTool` for the native `hindsight_*` knowledge tools. Pi 1.4+ uses a
+ * config-only system guide and a once-per-branch persistent recall message, never request-local
+ * tail messages; Prime Agent and older Pi get the combined block as a hidden user-turn message. The
  * harness name also selects `harnesses.<name>` config, feeds `{harness}` bank templating, and keeps
  * sessions attributable in diagnostics separately.
  *
@@ -30,8 +30,6 @@ interface BeforeAgentStartEvent {
   /** Custom-message runs have no user prompt (Pi >= 1.2.0). */
   messageType?: "user" | "custom";
   prompt?: string;
-  /** The fully assembled system prompt for this turn. */
-  systemPrompt: string;
   /** Present on hosts that compose the prompt from extension sections. */
   systemPromptOptions?: { sections: Record<string, string> };
 }
@@ -42,8 +40,9 @@ interface AgentEndEvent {
   messages: readonly PiMessage[];
 }
 
+/** A custom message for the host to store after the user's prompt. It reaches the model as a
+ *  user message; `display: false` keeps it out of the transcript view. */
 interface BeforeAgentStartResult {
-  systemPrompt?: string;
   message?: { customType: string; content: string; display: boolean };
 }
 
@@ -242,21 +241,19 @@ export function createPiHooks(
           ? { message: { customType: RECALL_MESSAGE, content: recall, display: false } }
           : undefined;
       }
-      if (prompt) await core.onPrompt(sessionId, prompt);
+      // Called on an empty prompt too, so the core drops the previous turn's block (see onPrompt).
+      await core.onPrompt(sessionId, prompt);
       const injection = core.getInjection(sessionId);
       if (!injection) {
         diag(harness, "inject_empty", { session: sessionId });
         return undefined;
       }
       diag(harness, "inject_ok", { session: sessionId, chars: injection.length });
-      // Hosts that compose the prompt from sections get the memory as one: a returned systemPrompt
-      // forces the whole prompt, so sections added by later extensions are dropped (#4841). Older
-      // hosts without sections still take the appended full prompt below.
-      if (event.systemPromptOptions?.sections) {
-        event.systemPromptOptions.sections.hindsight = injection;
-        return undefined;
-      }
-      return { systemPrompt: `${event.systemPrompt}\n\n${injection}` };
+      // A message, not the system prompt: the block changes between turns, so a system prompt
+      // carrying it broke the provider's prefix cache (#5914), while a stored message stays in the
+      // turn it was made for. It also leaves other extensions' prompt sections alone, which a
+      // returned systemPrompt did not (#4841).
+      return { message: { customType: "hindsight", content: injection, display: false } };
     },
     /** `branch` is the session's entries (`sessionManager.getBranch()`): the event alone holds only
      *  the latest run, and writing that back replaced the session's earlier runs (#4963). */

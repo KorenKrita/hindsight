@@ -89,7 +89,7 @@ describe("bundled Pi host version gate", () => {
       expect(result).toEqual(
         apiVersion
           ? { factory: "function", version: "1.4.0", section: "STABLE", recall: "RECALL" }
-          : { factory: "function", section: "LEGACY" }
+          : { factory: "function", recall: "LEGACY" }
       );
     }
   );

@@ -18,25 +18,23 @@ describe("pi extension adapter", () => {
     const sections: Record<string, string> = { base: "You are pi." };
     if (order === "before") sections.other = "SECTION-MARKER";
     const result = await hooks.beforeAgentStart(
-      {
-        prompt: "hi",
-        systemPrompt: Object.values(sections).join("\n\n"),
-        systemPromptOptions: { sections },
-      },
+      { prompt: "hi", systemPromptOptions: { sections } },
       "session-1",
       []
     );
     if (order === "after") sections.other = "SECTION-MARKER";
-    const prompt = result?.systemPrompt ?? Object.values(sections).join("\n\n");
+    const prompt = Object.values(sections).join("\n\n");
     expect(prompt).toContain("You are pi.");
     expect(prompt).toContain("SECTION-MARKER");
     expect(prompt).toContain("Stable tool guide");
     expect(prompt).not.toContain("remember this");
-    expect(result?.systemPrompt).toBeUndefined();
+    expect(result).not.toHaveProperty("systemPrompt");
     expect(result?.message?.content).toBe("<hindsight_memories>remember this</hindsight_memories>");
   });
 
-  it("recalls on each prompt and appends the injection to the system prompt", async () => {
+  it("recalls on each prompt and adds the injection as a hidden message, not to the system prompt", async () => {
+    // The block changes between turns, so a system prompt carrying it broke the provider's prefix
+    // cache (#5914); returning a systemPrompt also dropped later extensions' sections (#4841).
     const onPrompt = vi.fn(async () => {});
     const core = {
       onPrompt,
@@ -44,17 +42,26 @@ describe("pi extension adapter", () => {
       onTranscript: vi.fn(async () => {}),
     };
     const hooks = createPiHooks(core as never, "pi");
+    const sections: Record<string, string> = { base: "You are pi." };
+    const event = {
+      prompt: "  plan the change  ",
+      systemPrompt: "You are pi.",
+      systemPromptOptions: { sections },
+    };
 
-    const result = await hooks.beforeAgentStart(
-      { prompt: "  plan the change  ", systemPrompt: "You are pi." },
-      "session-1"
-    );
+    const result = await hooks.beforeAgentStart(event, "session-1");
 
     expect(onPrompt).toHaveBeenCalledOnce();
     expect(onPrompt).toHaveBeenCalledWith("session-1", "plan the change");
-    expect(result?.systemPrompt).toBe(
-      "You are pi.\n\n<hindsight_memories>remember this</hindsight_memories>"
-    );
+    expect(result).toEqual({
+      message: {
+        customType: "hindsight",
+        content: "<hindsight_memories>remember this</hindsight_memories>",
+        display: false,
+      },
+    });
+    expect(result).not.toHaveProperty("systemPrompt");
+    expect(sections).toEqual({ base: "You are pi." });
   });
 
   it("injects nothing when the core has no injection for this turn", async () => {
@@ -64,7 +71,7 @@ describe("pi extension adapter", () => {
       onTranscript: vi.fn(async () => {}),
     };
     const hooks = createPiHooks(core as never, "pi");
-    const result = await hooks.beforeAgentStart({ prompt: "hi", systemPrompt: "sys" }, "session-1");
+    const result = await hooks.beforeAgentStart({ prompt: "hi" }, "session-1");
     expect(result).toBeUndefined();
   });
 
@@ -79,10 +86,7 @@ describe("pi extension adapter", () => {
       onTranscript: vi.fn(async () => {}),
     };
     const hooks = createPiHooks(core as never, "pi", sessionStart);
-    const pending = hooks.beforeAgentStart(
-      { prompt: "first prompt", systemPrompt: "sys" },
-      "session-1"
-    );
+    const pending = hooks.beforeAgentStart({ prompt: "first prompt" }, "session-1");
 
     await Promise.resolve();
     expect(core.onPrompt).not.toHaveBeenCalled();
@@ -259,14 +263,8 @@ describe("pi extension factory", () => {
     pi.handlers.session_start({}, ctx("/repo-a", "s-a"));
     expect(pi.tools.map((t) => t.name)).toEqual(["hindsight_reflect"]);
 
-    await pi.handlers.before_agent_start(
-      { prompt: "hello a", systemPrompt: "sys" },
-      ctx("/repo-a", "s-a")
-    );
-    await pi.handlers.before_agent_start(
-      { prompt: "hello b", systemPrompt: "sys" },
-      ctx("/repo-b", "s-b")
-    );
+    await pi.handlers.before_agent_start({ prompt: "hello a" }, ctx("/repo-a", "s-a"));
+    await pi.handlers.before_agent_start({ prompt: "hello b" }, ctx("/repo-b", "s-b"));
     expect(cores.get("/repo-a")?.onPrompt).toHaveBeenCalledExactlyOnceWith("s-a", "hello a");
     expect(cores.get("/repo-b")?.onPrompt).toHaveBeenCalledExactlyOnceWith("s-b", "hello b");
 

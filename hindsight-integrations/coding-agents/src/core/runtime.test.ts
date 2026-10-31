@@ -97,6 +97,28 @@ describe("RuntimeCore", () => {
     expect(warm).toContain("2 knowledge pages cover");
     expect(warm).not.toContain("No knowledge pages yet");
   });
+
+  it("states the tool guide once on the first turn, then refreshes it on later turns", async () => {
+    const client = {
+      listDocumentIds: vi.fn(async () => new Set(["git:existing"])),
+      listPages: vi.fn(async () => ({ items: [] })),
+      reflect: vi.fn(async () => ""),
+    } as unknown as HindsightClient;
+    // pageRefreshEveryTurns defaults to 1, so every turn is a refresh turn.
+    const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
+    const count = (s: string, needle: string) => s.split(needle).length - 1;
+
+    await runtime.onPrompt("session-guide-once", "first prompt");
+    const first = runtime.getInjection("session-guide-once") ?? "";
+    expect(first).toContain("<hindsight_knowledge>");
+    expect(first).not.toContain("<hindsight_knowledge_refresh>");
+    expect(count(first, "hindsight_search_knowledge_pages(query) — FIRST STOP")).toBe(1);
+
+    await runtime.onPrompt("session-guide-once", "second prompt");
+    const second = runtime.getInjection("session-guide-once") ?? "";
+    expect(second).not.toContain("<hindsight_knowledge>");
+    expect(second).toContain("<hindsight_knowledge_refresh>");
+  });
 });
 
 /**

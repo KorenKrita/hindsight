@@ -235,8 +235,11 @@ export async function buildHookOutput(args: {
   cfg: Config;
   client: HookClient;
   cacheFile: string;
+  /** False on a turn whose caller injects the full knowledge preamble itself (the persistent-plugin
+   *  runtime on a session's first turn): the preamble already carries the tool guide. */
+  rosterRefresh?: boolean;
 }): Promise<HookOutput> {
-  const { harness, prompt, cfg, client, cacheFile } = args;
+  const { harness, prompt, cfg, client, cacheFile, rosterRefresh = true } = args;
 
   const cached = readSessionCache(cacheFile);
   const turns = (cached.turns ?? 0) + 1;
@@ -384,7 +387,7 @@ export async function buildHookOutput(args: {
   // hindsight_search_knowledge_pages when a question warrants it — an unprompted injection on
   // every turn (even a plain "yes") read as phantom research. The roster below keeps the tool
   // and the page names in front of the agent.
-  if (cadence > 0 && turns % cadence === 0) {
+  if (rosterRefresh && cadence > 0 && turns % cadence === 0) {
     blocks.push(
       buildRosterRefresh(pages, {
         reflectOnNewGoals: cfg.autoInject !== "reflect",

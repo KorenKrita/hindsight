@@ -1,4 +1,4 @@
-"""What one knowledge-page refresh costs, measured in the LLM calls it makes.
+"""What one page refresh costs, measured in the LLM calls it makes.
 
 The quality evals ask whether a refresh writes the right page. This asks what it
 paid to write it: every LLM call the refresh made, with its input, cached and
@@ -404,9 +404,10 @@ class CostReport(BaseModel):
     timestamp: str
     model: str
     fixture: str
-    #: Whether reflect built explicit per-step caches (HINDSIGHT_API_REFLECT_PROMPT_CACHE_ENABLED),
-    #: which changes how cached tokens are billed — see ``RefreshCost.cost``.
-    explicit_cache: bool = True
+    #: Whether reflect built explicit per-step caches, which changes how cached tokens are
+    #: billed — see ``RefreshCost.cost``. True only in reports from before that cache was
+    #: removed (it was HINDSIGHT_API_REFLECT_PROMPT_CACHE_ENABLED).
+    explicit_cache: bool = False
     refreshes: list[RefreshCost]
 
 
@@ -607,7 +608,7 @@ async def build_bank(
 
     pages = []
     for name, query in PAGES.items():
-        await client.knowledge_base.create_knowledge_page(
+        await client.pages.create_page(
             bank_id,
             {"name": name, "source_query": query, "max_tokens": PAGE_MAX_TOKENS, "trigger": page_trigger()},
         )

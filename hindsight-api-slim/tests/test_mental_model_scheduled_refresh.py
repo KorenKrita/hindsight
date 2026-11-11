@@ -12,14 +12,23 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import aiohttp
 import pytest
 
-from hindsight_api.api.http import MentalModelTrigger
 from hindsight_api.engine.llm_interface import ProviderContentPolicyError, ProviderRateLimitResetError
 from hindsight_api.engine.maintenance import MaintenanceLoop
 from hindsight_api.engine.memories import get_memories
 from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.reflect import ReflectToolExecutionError
+from hindsight_api.engine.response_models import MentalModelTrigger
 from tests.store_seed import store_write_facts
+
+# The scheduled-refresh pass scans every bank in the shared test database, and
+# several tests here let it really submit (or queue behind a stalled worker) a
+# refresh for every due model it finds. Run on another xdist worker, such a pass
+# claims a model a concurrent test just inserted — it is then refreshed or
+# in flight, so that test's own pass skips it. One group keeps the passes serial.
+pytestmark = pytest.mark.xdist_group("mental_model_scheduled_refresh")
 
 
 def test_full_refresh_cron_combines_with_either_trigger():
@@ -373,11 +382,14 @@ async def test_failed_model_is_not_requeued_until_a_refresh_succeeds(
     bank = await _make_bank(memory, request_context)
     async with memory._pool.acquire() as conn:
         mm_id = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
-    await _new_fact(memory, bank)
     _stall_worker(memory, monkeypatch)
+    # Fail it before it goes stale. The pass scans every bank in the shared database, so
+    # one run by another test process between "stale" and "failed" would queue this
+    # model for real and the zero below would read one (#6390).
     await memory._record_mental_model_refresh_failure(
         bank, mm_id, outcome="refresh_failed_error", failure_reason="unexpected_error", error_message="boom"
     )
+    await _new_fact(memory, bank)
 
     loop = MaintenanceLoop(memory)
     await loop._run_scheduled_mm_refresh()
@@ -400,6 +412,16 @@ class _ProviderStatusError(Exception):
         self.status_code = status_code
 
 
+def _reflect_tool_failure(cause: BaseException) -> ReflectToolExecutionError:
+    """What a refresh raises when a reranker or embedder call inside reflect's search fails:
+    the provider error two ``raise ... from`` links down (#6140)."""
+    search_error = RuntimeError(f"Failed to search memories ({type(cause).__name__}): {cause!r}")
+    search_error.__cause__ = cause
+    tool_error = ReflectToolExecutionError(f"Reflect tool 'search_observations' failed on iteration 1: {search_error}")
+    tool_error.__cause__ = search_error
+    return tool_error
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
@@ -407,8 +429,10 @@ class _ProviderStatusError(Exception):
         _ProviderStatusError(429),
         _ProviderStatusError(503),
         ProviderRateLimitResetError(retry_at=datetime.now(UTC) + timedelta(hours=1), message="session limit"),
+        _reflect_tool_failure(_ProviderStatusError(429)),
+        _reflect_tool_failure(aiohttp.SocketTimeoutError("Timeout on reading data from socket")),
     ],
-    ids=["rate-limit", "provider-down", "quota-reset"],
+    ids=["rate-limit", "provider-down", "quota-reset", "wrapped-reranker-429", "wrapped-reranker-timeout"],
 )
 async def test_a_temporary_provider_failure_does_not_pause_automatic_refresh(
     memory: MemoryEngine, request_context, monkeypatch, error
@@ -496,6 +520,23 @@ async def test_refresh_cut_off_during_a_retry_backoff_does_not_pause(
 
 
 @pytest.mark.asyncio
+async def test_refresh_cut_off_while_queued_for_an_llm_permit_does_not_pause(memory: MemoryEngine, request_context):
+    """#6140: the time ran out waiting for capacity other refreshes held, not on this prompt."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        mm_id = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
+
+    await memory.on_task_wall_timeout(
+        {"type": "refresh_mental_model", "bank_id": bank, "mental_model_id": mm_id},
+        None,
+        "timed out",
+        "llm.deepseek.tools.queued",
+    )
+
+    assert await memory._automatic_refresh_paused(bank, mm_id) is False
+
+
+@pytest.mark.asyncio
 async def test_the_failure_is_visible_on_the_model_and_cleared_by_a_success(memory: MemoryEngine, request_context):
     """`last_refresh_failed_at` is what the UI reads to say a model has stopped
     refreshing itself, so it has to be on the read and gone again after a success."""
@@ -515,6 +556,30 @@ async def test_the_failure_is_visible_on_the_model_and_cleared_by_a_success(memo
     refreshed = await memory.get_mental_model(bank, mm_id, request_context=request_context)
     assert refreshed["last_refresh_failed_at"] is None
     assert await memory._automatic_refresh_paused(bank, mm_id) is False
+
+
+@pytest.mark.asyncio
+async def test_bank_stats_count_paused_models_until_a_success(memory: MemoryEngine, request_context):
+    """An operator never opens the page, so the paused count on /stats is how a
+    model that stopped refreshing itself gets noticed (#6077)."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        mm_id = await _insert_mm(conn, bank, refresh_cron=None, last_refreshed_offset="1 day")
+        await _insert_mm(conn, bank, refresh_cron=None, last_refreshed_offset="1 day")
+
+    async def paused() -> int:
+        stats = await memory.get_bank_stats(bank, request_context=request_context, force_refresh=True)
+        return stats["paused_mental_models"]
+
+    assert await paused() == 0
+    await memory._record_mental_model_refresh_failure(
+        bank, mm_id, outcome="refresh_failed_error", failure_reason="unexpected_error", error_message="boom"
+    )
+    assert await paused() == 1
+    assert await memory._automatic_refresh_paused(bank, mm_id) is True
+
+    await memory.update_mental_model(bank, mm_id, content="a fresh answer", request_context=request_context)
+    assert await paused() == 0
 
 
 # ── scheduled full refresh (trigger.full_refresh_cron, #4340) ────────────────
@@ -683,3 +748,34 @@ async def test_a_full_refresh_folded_into_a_queued_one_upgrades_it(memory: Memor
     await memory.submit_async_refresh_mental_model(bank_id=bank, mental_model_id=mm_id, request_context=request_context)
     assert (await _queued_payload(memory, plain["operation_id"]))["_mode"] == "full"
     assert await _count_refresh_ops(memory, bank) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stop_ends_the_pass_between_models(memory: MemoryEngine, request_context, monkeypatch):
+    """A pass over many due models stops at the next model once the loop is stopped.
+
+    Shutdown waits on the pass, and one over thousands of due models takes far longer
+    than any termination grace period; the models not reached are still due next time.
+    """
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        for _ in range(3):
+            await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
+    await _new_fact(memory, bank)
+
+    loop = MaintenanceLoop(memory)
+    submitted: list[str] = []
+
+    async def _record_then_stop(
+        *, bank_id, mental_model_id, request_context, skip_if_in_flight=False, automatic=False, mode=None
+    ):
+        submitted.append(mental_model_id)
+        loop._stop.set()  # shutdown arrives while the first model is being submitted
+        return {"operation_id": str(uuid.uuid4())}
+
+    monkeypatch.setattr(memory, "submit_async_refresh_mental_model", _record_then_stop)
+    await loop._run_scheduled_mm_refresh()
+
+    # Discovery spans every schema, so under a parallel run the first model reached may be
+    # another test's; what matters is that nothing after it was.
+    assert len(submitted) == 1

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,9 +52,69 @@ describe("RuntimeCore", () => {
     expect(runtime.getInjection("runtime-shared-lifecycle")).toContain("shared reflect");
   });
 
-  it("the knowledge roster tracks the pages a SESSION sees, not the ones plugin load saw", async () => {
+  it("hands out a block once per turn: no other session's, and none on a prompt with no text", async () => {
+    // Every host now stores the block in the user message, so a stale or borrowed one would be
+    // stored twice — the fallback to the most recent block was only for v1's system.transform.
+    const client = {
+      listDocumentIds: vi.fn(async () => new Set(["git:existing"])),
+      listPages: vi.fn(async () => ({ items: [] })),
+      reflect: vi.fn(async () => "a memory"),
+    } as unknown as HindsightClient;
+    const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
+
+    // Fresh ids: the once-per-session cache lives in the OS tempdir and outlives a test run.
+    const a = `session-a-${randomUUID()}`;
+    await runtime.onPrompt(a, "first prompt");
+    expect(runtime.getInjection(a)).toContain("a memory");
+    expect(runtime.getInjection(`session-b-${randomUUID()}`)).toBeUndefined();
+
+    await runtime.onPrompt(a, "   ");
+    expect(runtime.getInjection(a)).toBeUndefined();
+  });
+
+  it("drops a host's injected tags from the prompt before reflecting on it (#6488)", async () => {
+    const client = {
+      listDocumentIds: vi.fn(async () => new Set(["git:existing"])),
+      listPages: vi.fn(async () => ({ items: [] })),
+      reflect: vi.fn(async () => "a memory"),
+    } as unknown as HindsightClient;
+    const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
+    const reflect = vi.mocked(client.reflect);
+
+    const a = `session-a-${randomUUID()}`;
+    await runtime.onPrompt(a, "<system-reminder>host text</system-reminder>");
+    expect(reflect).not.toHaveBeenCalled();
+    expect(runtime.getInjection(a)).toBeUndefined();
+
+    await runtime.onPrompt(
+      a,
+      "<system-reminder>\nhost text\n</system-reminder>\n\nwhy does upload retry fail?"
+    );
+    expect(reflect).toHaveBeenCalledTimes(1);
+    expect(reflect.mock.calls[0][0]).not.toContain("system-reminder");
+    expect(reflect.mock.calls[0][0]).toContain("why does upload retry fail?");
+  });
+
+  it("shows the recall toast as plain text, without the terminal's color codes (#6257)", async () => {
+    const client = {
+      listDocumentIds: vi.fn(async () => new Set(["git:existing"])),
+      listPages: vi.fn(async () => ({ items: [] })),
+      reflect: vi.fn(async () => "a memory"),
+    } as unknown as HindsightClient;
+    const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
+    const notify = vi.fn();
+    runtime.setNotifier(notify);
+
+    await runtime.onPrompt(`session-${randomUUID()}`, "first prompt");
+
+    const toast = notify.mock.calls.find(([title]) => title.includes("recalled"));
+    expect(toast?.[1]).toContain("Hindsight");
+    expect(toast?.[1]).not.toContain("\x1b");
+  });
+
+  it("the page roster tracks the pages a SESSION sees, not the ones plugin load saw", async () => {
     // These hosts outlive every session. A preamble frozen at load told each new session "No
-    // knowledge pages yet" for the process's whole life, while the same turn's memory block listed
+    // pages yet" for the process's whole life, while the same turn's memory block listed
     // pages by id — the agent was told both, and believed the stale half (#4607).
     let pages: { id: string; name: string }[] = [];
     const client = {
@@ -65,7 +126,7 @@ describe("RuntimeCore", () => {
 
     await runtime.seedIfCold("/definitely-not-a-git-repository"); // cold: zero pages
     await runtime.onPrompt("session-cold", "first prompt");
-    expect(runtime.getInjection("session-cold")).toContain("No knowledge pages yet");
+    expect(runtime.getInjection("session-cold")).toContain("No pages yet");
 
     pages = [
       { id: "kp-1", name: "Component map" },
@@ -73,8 +134,8 @@ describe("RuntimeCore", () => {
     ];
     await runtime.onPrompt("session-warm", "first prompt");
     const warm = runtime.getInjection("session-warm") ?? "";
-    expect(warm).toContain("2 knowledge pages cover");
-    expect(warm).not.toContain("No knowledge pages yet");
+    expect(warm).toContain("2 pages cover");
+    expect(warm).not.toContain("No pages yet");
   });
 
   it("states the tool guide once on the first turn, then refreshes it on later turns", async () => {
@@ -89,14 +150,14 @@ describe("RuntimeCore", () => {
 
     await runtime.onPrompt("session-guide-once", "first prompt");
     const first = runtime.getInjection("session-guide-once") ?? "";
-    expect(first).toContain("<hindsight_knowledge>");
-    expect(first).not.toContain("<hindsight_knowledge_refresh>");
-    expect(count(first, "hindsight_search_knowledge_pages(query) — FIRST STOP")).toBe(1);
+    expect(first).toContain("<hindsight_pages>");
+    expect(first).not.toContain("<hindsight_page_refresh>");
+    expect(count(first, "hindsight_search_pages(query) — FIRST STOP")).toBe(1);
 
     await runtime.onPrompt("session-guide-once", "second prompt");
     const second = runtime.getInjection("session-guide-once") ?? "";
-    expect(second).not.toContain("<hindsight_knowledge>");
-    expect(second).toContain("<hindsight_knowledge_refresh>");
+    expect(second).not.toContain("<hindsight_pages>");
+    expect(second).toContain("<hindsight_page_refresh>");
   });
 });
 
@@ -184,7 +245,7 @@ describe("RuntimeCore session-idle write-back", () => {
 
       runtime.setTranscriptSource(async () => [
         turn("user", "how do we round?"),
-        turn("action", "hindsight_search_knowledge_pages rounding"),
+        turn("action", "hindsight_search_pages rounding"),
         turn("assistant", "🧠 From Hindsight memory — half up"),
       ]);
       await runtime.onSessionIdle("s6");
@@ -198,7 +259,7 @@ describe("RuntimeCore session-idle write-back", () => {
           session: "s6",
           bank: "bank-1",
           turn: 1,
-          calls: ["hindsight_search_knowledge_pages"],
+          calls: ["hindsight_search_pages"],
           credited: true,
         },
       ]);

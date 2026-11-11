@@ -6,15 +6,14 @@
  * a bag of named hooks; a v2 plugin is `{id, setup(ctx)}` where `ctx` hands out per-domain
  * registration calls. The mapping this file implements:
  *
- *   v1 `chat.message`                       -> `ctx.session.hook("prompt")`
- *   v1 `experimental.chat.system.transform` -> `ctx.session.hook("context")` (push a SystemPart)
+ *   v1 `chat.message` (+ synthetic part)    -> `ctx.session.hook("prompt")` + `.synthetic()`
  *   v1 `tool: {...}` (native tools)         -> `ctx.tool.transform(draft => draft.add(...))`
  *   v1 `event` (session.idle)               -> `ctx.event.subscribe()` async iterator
  *   v1 `client.session.messages()`          -> `ctx.session.context({sessionID})`
  *
- * Everything behind those five seams is the harness-agnostic RuntimeCore, exactly as for v1, so
+ * Everything behind those four seams is the harness-agnostic RuntimeCore, exactly as for v1, so
  * opencode2 gets the same surface: per-turn recall + attribution/user-feedback injection, the
- * hindsight_* knowledge tools, cold-check auto-seed and rich write-back.
+ * hindsight_* page tools, cold-check auto-seed and rich write-back.
  *
  * Two deliberate differences from the v1 adapter, both forced by the host:
  *
@@ -24,9 +23,9 @@
  *    the config file is not a sandbox either: the user's own global `permissions` are appended
  *    AFTER an agent's rules (verified against 0.0.0-beta-18743, where `explore`'s `edit: deny`
  *    ends up followed by a user's `edit: allow`). The survey reads untrusted repo files, so
- *    without a guaranteed read-only boundary it must not run under this host — opencode2 falls
- *    back to another installed agent's CLI, the same treatment kilo/cline/cursor/dcode already
- *    get (core/survey.ts). Revisit if v2 gains plugin-defined agents.
+ *    without a guaranteed read-only boundary it must not run under this host — opencode2 gets no
+ *    survey, the same as kilo/cline/cursor/dcode (core/survey.ts). Revisit if v2 gains
+ *    plugin-defined agents.
  *
  *  - NO toast. v2's plugin client can OBSERVE `tui.toast.show` events but cannot publish one, so
  *    the seed banner is logged rather than shown. `RuntimeCore.notify` is optional and fail-open.
@@ -48,7 +47,7 @@ import { resolveHostMemory } from "../core/host-client";
 import { describeError } from "../core/log";
 import { diag } from "../core/diag";
 import { RuntimeCore } from "../core/runtime";
-import type { ToolSpec } from "../core/knowledge-tools";
+import type { ToolSpec } from "../core/page-tools";
 import { readOpencode2Messages, type Oc2Message } from "../core/transcript-opencode2";
 import { readPackagedSkill } from "../core/skill-sync";
 import { resolveProjectDirectory } from "./plugin-entry";
@@ -163,7 +162,7 @@ export async function wireOpencode2Runtime(
     readOpencode2Messages((await ctx.session.context({ sessionID })) as Oc2Message[])
   );
 
-  // Register the full hindsight_* knowledge + recall suite natively (no MCP server needed).
+  // Register the full hindsight_* page + recall suite natively (no MCP server needed).
   await ctx.tool.transform((draft) => {
     for (const spec of core.toolSpecs()) draft.add(toOpencode2Tool(spec));
   });
@@ -174,20 +173,35 @@ export async function wireOpencode2Runtime(
   // without it.
   const ownSessions = new Set<string>();
 
-  // Each user turn: recall on the prompt; the injection it builds is pushed by the context hook.
+  // Each user turn: recall on the prompt, then add this turn's injection (recalled memories +
+  // attribution/user-feedback framing, plus the pages preamble on turn 1 and the roster refresh
+  // on cadence) as a synthetic message — a stored, model-facing user message the host lands just
+  // before the prompt (verified against 0.0.0-beta-18743), and that `resume: false` keeps from
+  // starting a run of its own. Stored, it stays in the turn it was made for and every later request
+  // repeats it byte for byte. It used to be pushed into the system prompt from the `context` hook,
+  // which made the system prompt change between turns and broke the provider's prefix cache
+  // (#5914).
   await ctx.session.hook("prompt", async (input) => {
     ownSessions.add(input.sessionID);
     await core.onPrompt(input.sessionID, input.prompt?.text ?? "");
-  });
-
-  // Push this turn's injection (recalled memories + attribution/user-feedback framing, plus the
-  // knowledge preamble on turn 1 and the roster refresh on cadence) into the system prompt every
-  // turn. Unlike v1's system.transform this hook DOES carry the session id, so the lookup is
-  // always session-keyed.
-  await ctx.session.hook("context", (input) => {
     const inj = core.getInjection(input.sessionID);
-    if (inj) input.system.push({ type: "text", text: inj });
-    diag(harness, inj ? "inject_ok" : "inject_empty", { chars: inj?.length ?? 0 });
+    if (!inj) {
+      diag(harness, "inject_empty", { chars: 0 });
+      return;
+    }
+    try {
+      await ctx.session.synthetic({
+        sessionID: input.sessionID,
+        text: inj,
+        description: "Hindsight memory",
+        resume: false,
+      });
+      diag(harness, "inject_ok", { chars: inj.length });
+    } catch (e) {
+      // Fail-open like every other seam here: a rejected message costs this turn its memory, never
+      // the prompt.
+      diag(harness, "inject_failed", { error: describeError(e) });
+    }
   });
 
   // Write-back (on by default). Refetching on idle — rather than replaying the list the context

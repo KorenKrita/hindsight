@@ -20,6 +20,8 @@ import queue
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -33,6 +35,7 @@ from tools.registry import tool_error
 from utils import read_json_or_empty
 
 from .embedded import (
+    _CLIENT_MODULES,
     _RETRIABLE_CONNECTION_MARKERS,
     _build_embedded_profile_env,
     _check_local_runtime,
@@ -189,6 +192,8 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None, timeo
 
     ``/v1/version`` first: an ingress that routes only ``/v1`` to the API hands a bare ``/version``
     to whatever else it fronts, whose 404 read as "no version" (same order as coding-agents, #5286).
+    ``/api/version`` last: a proxy that fronts the control plane at the root answers there with the
+    API's own version, which it relays (#6137).
     Raises ``_VersionProbeUnreachable`` when no version came back and either path failed to answer
     (connection error, timeout, 5xx), so the caller can tell "unknown" from "old": only a 4xx or a
     versionless body from every path means the server is old.
@@ -202,7 +207,7 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None, timeo
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     unanswered = False
-    for path in ("/v1/version", "/version"):
+    for path in ("/v1/version", "/version", "/api/version"):
         url = api_url.rstrip("/") + path
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:  # noqa: S310
@@ -285,6 +290,36 @@ _loop_lock = threading.Lock()
 
 # Pushed to the per-provider retain queue to wake the writer for a clean exit.
 _WRITER_SENTINEL = object()
+# A queued retain that fails on a transient error is kept and sent again ahead of the next one
+# (#5218); after this many tries, or on an error that can never succeed, it is dropped loudly.
+_RETAIN_MAX_ATTEMPTS = 5
+# Failed retains kept for resending while the server is down; the oldest go first past this.
+_RETAIN_BACKLOG_LIMIT = 100
+# An async retain the server accepted and then FAILED is re-queued server-side up to this many
+# times (#5591). The server still holds its payload, so nothing is resent from here.
+_SERVER_RETRY_LIMIT = 3
+# Async retain operations still watched for a server-side failure; the oldest go first past this.
+_UNSETTLED_OPS_LIMIT = 200
+
+
+@dataclass
+class _QueuedRetain:
+    """A writer job and how many times it has failed."""
+
+    job: Callable[[], None]
+    failures: int = 0
+
+
+def _retain_error_is_permanent(exc: BaseException) -> bool:
+    """A 4xx other than timeout/rate limit: the same request fails the same way every time."""
+    status = getattr(exc, "status", None)
+    return isinstance(status, int) and 400 <= status < 500 and status not in (408, 429)
+
+
+def _is_append_without_document_text(exc: BaseException) -> bool:
+    """The server's 400 for update_mode='append' on a bank with store_document_text off
+    (InvalidRetainRequestError in memory_engine.py; matched on its message, #5599)."""
+    return getattr(exc, "status", None) == 400 and "document text storage" in str(getattr(exc, "body", "") or exc)
 
 
 def _get_loop() -> asyncio.AbstractEventLoop:
@@ -441,6 +476,8 @@ _SESSION_KWARGS = (
     "agent_workspace",
     "cwd",
 )
+# aiohttp's message for a pooled keep-alive connection the server closed while it sat idle.
+_STALE_KEEPALIVE_MARKER = "server disconnected"
 # Retain metadata keys, each stamped from the attribute of the same name when set.
 _METADATA_ATTRS = (
     "session_id",
@@ -453,6 +490,8 @@ _METADATA_ATTRS = (
     "thread_id",
     "agent_identity",
 )
+# Retain metadata that differs on every call; left off appends to a session document (#6241).
+_PER_CALL_METADATA = frozenset({"retained_at", "message_count", "turn_index"})
 # Naming Hermes' built-in session_search tells the model when to pick each tool. With only
 # the tool names listed, models defaulted to session_search (raw transcripts) for every
 # history question and skipped Hindsight's deduplicated memories.
@@ -533,6 +572,15 @@ class HindsightMemoryProvider(MemoryProvider):
         # get_operation_status (a drained local queue is not a read-after-write signal).
         self._pending_retain_ops: set[tuple[str, str]] = set()
         self._pending_retain_ops_lock = threading.Lock()
+        # Every async op of an automatic retain until the server settles it, with how many
+        # times we asked the server to retry it. Unlike _pending_retain_ops (a visibility
+        # wait, dropped at its deadline), this is about durability: a failed op is re-queued
+        # (#5591). Guarded by _pending_retain_ops_lock; insertion order = age.
+        self._unsettled_retain_ops: dict[tuple[str, str], int] = {}
+        # Writer-thread only: retains that failed on a transient error, oldest first (#5218).
+        self._retain_backlog: list[_QueuedRetain] = []
+        # Set once the primary bank rejects append because it keeps no document text (#5599).
+        self._append_unsupported = False
         self._apply_retain_policy({})
 
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
@@ -559,6 +607,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 # the provider outright when this returns False, and every other runtime probe below
                 # runs after it has already passed.
                 return _check_local_runtime().available
+            # Hermes keeps a provider whose client cannot import and lets every recall and retain
+            # fail; a gateway started before the install runs without it (#6063).
+            if not _check_local_runtime(_CLIENT_MODULES).available:
+                return False
             return mode == "local_external" or bool(
                 _cloud_api_key(cfg) or cfg.get("api_url") or get_secret("HINDSIGHT_API_URL", "")
             )
@@ -567,7 +619,7 @@ class HindsightMemoryProvider(MemoryProvider):
             return False
 
     def unavailable_reason(self) -> str:
-        """Install hint for an unavailable local_embedded runtime (is_available() gates
+        """Install hint when this process can't import what the mode needs (is_available() gates
         initialize() out, so the hint it would log never fires; agent_init shows this).
 
         ``is_available()`` returns False for local modes when the embedded runtime can't be imported, so
@@ -575,11 +627,10 @@ class HindsightMemoryProvider(MemoryProvider):
         guidance here, where agent_init warns about an unavailable provider.
         """
         try:
-            if _load_config().get("mode", "cloud") not in _LOCAL_MODES:
-                return ""
+            local = _load_config().get("mode", "cloud") in _LOCAL_MODES
         except Exception:
             return ""
-        status = _check_local_runtime()
+        status = _check_local_runtime() if local else _check_local_runtime(_CLIENT_MODULES)
         return "" if status.available else _local_runtime_hint(status.reason).strip()
 
     def save_config(self, values, hermes_home):
@@ -950,16 +1001,19 @@ class HindsightMemoryProvider(MemoryProvider):
         """Schedule *coro* on the shared loop using the configured timeout."""
         return _run_sync(coro, timeout=self._timeout)
 
-    def _run_hindsight_operation(self, operation):
-        """Run an async client operation; for local_embedded, a stale-daemon
-        connection failure recreates the client and retries once."""
+    def _run_hindsight_operation(self, operation, *, repeatable: bool = True):
+        """Run an async client operation, recreating the client and retrying once when its
+        connection went stale: for local_embedded, a daemon that is no longer there; in any mode,
+        a pooled connection the server already closed (#5734). The server may have read a request
+        it dropped mid-way, so that retry is only for a *repeatable* operation."""
         try:
             return self._run_sync(operation(self._get_client()))
         except Exception as exc:
             text = f"{type(exc).__name__}: {exc}".lower()
-            if self._mode != "local_embedded" or not any(m in text for m in _RETRIABLE_CONNECTION_MARKERS):
+            stale_daemon = self._mode == "local_embedded" and any(m in text for m in _RETRIABLE_CONNECTION_MARKERS)
+            if not stale_daemon and not (repeatable and _STALE_KEEPALIVE_MARKER in text):
                 raise
-            logger.info("Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s", exc)
+            logger.info("Hindsight connection went stale; recreating client and retrying once: %s", exc)
             with self._client_lock:
                 stale, self._client = self._client, None
             if stale is not None:
@@ -1000,12 +1054,49 @@ class HindsightMemoryProvider(MemoryProvider):
                 continue
             try:
                 if job is _WRITER_SENTINEL:
+                    self._run_retains([])  # a last try for retains that failed earlier
                     return
-                job()
+                self._run_retains([job])
             except Exception as exc:
                 logger.warning("Hindsight retain failed: %s", exc, exc_info=True)
             finally:
                 self._retain_queue.task_done()
+
+    def _run_retains(self, jobs: list[Callable[[], None]]) -> None:
+        """Run the backlog of failed retains, then *jobs*, in order (writer thread).
+
+        A transient failure (unreachable server, timeout, 5xx) keeps that retain and every
+        one after it for the next call, so turns are not lost when a write fails after the
+        turn buffer moved on (#5218), and a down server costs one timeout per turn rather
+        than one per queued retain. Resending is safe for async retains: each carries its
+        own operation_id, which the server answers as a replay rather than new work. A sync
+        retain whose reply was lost may be stored twice; that beats losing it."""
+        self._settle_retain_ops()
+        queued = self._retain_backlog + [_QueuedRetain(job) for job in jobs]
+        self._retain_backlog = []
+        for index, entry in enumerate(queued):
+            try:
+                entry.job()
+            except Exception as exc:
+                entry.failures += 1
+                if _retain_error_is_permanent(exc) or entry.failures >= _RETAIN_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Hindsight retain failed after %d attempt(s), dropping it: %s",
+                        entry.failures,
+                        exc,
+                        exc_info=True,
+                    )
+                    continue
+                logger.warning(
+                    "Hindsight retain failed (attempt %d), will resend it with the next retain: %s",
+                    entry.failures,
+                    exc,
+                )
+                self._retain_backlog = queued[index:]
+                break
+        if (excess := len(self._retain_backlog) - _RETAIN_BACKLOG_LIMIT) > 0:
+            logger.warning("Hindsight retain backlog full; dropping the %d oldest unsent retain(s)", excess)
+            del self._retain_backlog[:excess]
 
     def _atexit_shutdown(self) -> None:
         try:
@@ -1014,18 +1105,79 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
-    def _track_retain_ops(self, retain_response, bank_id: str) -> None:
-        """Record the async ``operation_id``/``operation_ids`` of an aretain_batch reply
-        (pending until recall-visible). No id (older API / sync completion) leaves
-        only the local queue drain as a signal. Keyed per ``(bank_id, op_id)`` so
-        multi-bank writes poll the status endpoint of the bank each op targets."""
+    def _track_retain_ops(self, retain_response, bank_id: str, *, wait: bool = True) -> None:
+        """Record the async ``operation_id``/``operation_ids`` of an aretain_batch reply:
+        watched until the server settles it (a failed op is re-queued), and with *wait*
+        also pending until recall-visible (the next prefetch waits on it). No id
+        (older API / sync completion) leaves only the local queue drain as a signal. Keyed
+        per ``(bank_id, op_id)`` so multi-bank writes poll the status endpoint of the bank
+        each op targets."""
         raw_ids = [
             getattr(retain_response, "operation_id", None),
             *(getattr(retain_response, "operation_ids", None) or []),
         ]
         if ids := [str(op) for op in raw_ids if op]:
             with self._pending_retain_ops_lock:
-                self._pending_retain_ops.update((bank_id, op_id) for op_id in ids)
+                if wait:
+                    self._pending_retain_ops.update((bank_id, op_id) for op_id in ids)
+                for op_id in ids:
+                    self._unsettled_retain_ops.setdefault((bank_id, op_id), 0)
+                for key in list(self._unsettled_retain_ops)[:-_UNSETTLED_OPS_LIMIT]:
+                    del self._unsettled_retain_ops[key]
+
+    def _settle_retain_ops(self) -> None:
+        """One status check per watched async retain op (writer thread, before each write).
+
+        A server-side ``failed`` used to count as done, and with the turn buffer already
+        cleared that turn was lost (#5591). The server keeps a failed op's payload, so it is
+        re-queued there with POST /operations/{id}/retry, up to _SERVER_RETRY_LIMIT times.
+        Ops that end after this process exits are not retried. The first status check that
+        errors ends the pass: the server is likely down, and every further check would cost
+        a full timeout."""
+        from hindsight_client_api.exceptions import NotFoundException
+
+        with self._pending_retain_ops_lock:
+            watched = list(self._unsettled_retain_ops.items())
+        settled: list[tuple[str, str]] = []
+        retried: list[tuple[str, str]] = []
+        for (bank_id, op_id), retries in watched:
+            try:
+                resp = self._run_hindsight_operation(
+                    lambda client: client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id)
+                )
+            except NotFoundException:
+                settled.append((bank_id, op_id))
+                continue
+            except Exception as exc:
+                logger.debug("Hindsight retain op status check failed for %s: %s", op_id, exc)
+                break
+            status = str(getattr(resp, "status", "") or "").lower()
+            if status in {"completed", "cancelled"}:
+                settled.append((bank_id, op_id))
+            elif status == "failed":
+                settled.append((bank_id, op_id))
+                if retries >= _SERVER_RETRY_LIMIT:
+                    logger.warning(
+                        "Hindsight retain operation %s failed on the server %d times; giving up on it "
+                        "(it can still be retried from the control plane)",
+                        op_id,
+                        retries + 1,
+                    )
+                    continue
+                try:
+                    self._run_hindsight_operation(
+                        lambda client: client.operations.retry_operation(bank_id=bank_id, operation_id=op_id)
+                    )
+                except Exception as exc:
+                    logger.warning("Hindsight retain operation %s failed and could not be retried: %s", op_id, exc)
+                    continue
+                logger.warning("Hindsight retain operation %s failed on the server; asked it to retry", op_id)
+                retried.append((bank_id, op_id))
+        with self._pending_retain_ops_lock:
+            for key in settled:
+                retries = self._unsettled_retain_ops.pop(key, 0)
+                if key in retried:
+                    self._unsettled_retain_ops[key] = retries + 1
 
     def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
         """True when a server-side retain op is done or gone (completed ops are evicted,
@@ -1121,6 +1273,8 @@ class HindsightMemoryProvider(MemoryProvider):
         """
         url = self._embedded_url if self._mode == "local_embedded" else None
         probe_url = str(url) if url else (self._api_url or "")
+        if self._append_unsupported:
+            return fallback_document_id, None
         if self._session_id and _check_api_supports_update_mode_append(probe_url, self._api_key):
             return self._session_id, "append"
         return fallback_document_id, None
@@ -1742,18 +1896,28 @@ class HindsightMemoryProvider(MemoryProvider):
         return item
 
     def _retain_batch(
-        self, item: dict, *, bank_id: str, document_id: str | None = None, retain_async: bool | None = None
+        self,
+        item: dict,
+        *,
+        bank_id: str,
+        document_id: str | None = None,
+        retain_async: bool | None = None,
+        operation_id: str | None = None,
     ):
-        """Dispatch one item via aretain_batch (bank_id/document_id/retain_async are
-        call-level args, never item keys)."""
+        """Dispatch one item via aretain_batch (bank_id/document_id/retain_async/operation_id
+        are call-level args, never item keys). *operation_id* only applies to async retains."""
         kwargs: Dict[str, Any] = {
             "bank_id": bank_id,
             "items": [item],
             "document_id": document_id,
             "retain_async": retain_async,
+            "operation_id": operation_id if retain_async else None,
         }
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs))
+        # A retain is only safe to resend under its operation id, which the server replays.
+        return self._run_hindsight_operation(
+            lambda client: client.aretain_batch(**kwargs), repeatable="operation_id" in kwargs
+        )
 
     def _make_turn_retain_job(
         self, turns: list[str], *, document_id: str, update_mode: str | None, label: str, track_ops: bool = True
@@ -1764,6 +1928,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # when the document is a list of messages, not a list of per-turn lists.
         content = json.dumps([message for turn in turns for message in json.loads(turn)], ensure_ascii=False)
         metadata = self._build_metadata(message_count=len(turns) * 2, turn_index=self._turn_index)
+        if update_mode == "append":
+            # An append sets the document's metadata on every memory the session already has, so a
+            # value that changes per call would rewrite all of them on each turn (#6241).
+            metadata = {k: v for k, v in metadata.items() if k not in _PER_CALL_METADATA}
         occurred_at = _event_timestamp()
         # A session named as its own parent (in-place compaction) is no lineage; tagging it
         # would flip the document's tag set and re-consolidate it from scratch.
@@ -1772,6 +1940,11 @@ class HindsightMemoryProvider(MemoryProvider):
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
         bank_ids = list(self._write_bank_ids)
         retain_async, retain_context = self._retain_async, self._retain_context
+        # Fixed per job and bank, so a resend after a failure the server did receive is a
+        # replay, not a second copy (#5218). One id can't serve two banks: the server answers 409.
+        operation_ids = {bank_id: str(uuid.uuid4()) for bank_id in bank_ids}
+        # Where these turns go when the bank refuses append (#5599); fixed so a resend reuses it.
+        own_document_id = f"{document_id}-{uuid.uuid4().hex[:12]}"
 
         def _job() -> None:
             item = self._build_retain_kwargs(
@@ -1794,11 +1967,37 @@ class HindsightMemoryProvider(MemoryProvider):
                     len(content),
                     len(turns),
                 )
-                resp = self._retain_batch(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async)
+
+                def _send(payload: dict, target_document_id: str):
+                    return self._retain_batch(
+                        payload,
+                        bank_id=bank_id,
+                        document_id=target_document_id,
+                        retain_async=retain_async,
+                        operation_id=operation_ids[bank_id],
+                    )
+
+                try:
+                    resp = _send(item, document_id)
+                except Exception as exc:
+                    # A bank with store_document_text off accepts a session's first append (it
+                    # creates the document) and refuses every later one. Stop appending, and
+                    # send these turns as their own document so they are not lost.
+                    if update_mode != "append" or not _is_append_without_document_text(exc):
+                        raise
+                    if not self._append_unsupported:
+                        logger.warning(
+                            "Hindsight bank %s keeps no document text, so it cannot append to a "
+                            "session document; retaining each batch of turns as its own document",
+                            bank_id,
+                        )
+                        self._append_unsupported = True
+                    # Same operation_id: the refused append was never queued, so the id is unused.
+                    resp = _send({k: v for k, v in item.items() if k != "update_mode"}, own_document_id)
                 # Async retains are only *accepted* here; track the op id(s) so the
                 # next-turn prefetch can wait for true server-side completion.
-                if retain_async and track_ops:
-                    self._track_retain_ops(resp, bank_id)
+                if retain_async:
+                    self._track_retain_ops(resp, bank_id, wait=track_ops)
 
             self._write_to_banks(bank_ids, _write)
             logger.debug("Hindsight %s succeeded", label)
@@ -1884,11 +2083,16 @@ class HindsightMemoryProvider(MemoryProvider):
             tags=["builtin-memory", f"builtin-target:{target}", f"builtin-action:{action}"],
         )
         bank_ids, retain_async = list(self._write_bank_ids), self._retain_async
-        self._enqueue_retain(
-            lambda: self._write_to_banks(
-                bank_ids, lambda bank_id: self._retain_batch(item, bank_id=bank_id, retain_async=retain_async)
+        operation_ids = {bank_id: str(uuid.uuid4()) for bank_id in bank_ids}  # replay-safe resend (#5218)
+
+        def _write(bank_id: str) -> None:
+            resp = self._retain_batch(
+                item, bank_id=bank_id, retain_async=retain_async, operation_id=operation_ids[bank_id]
             )
-        )
+            if retain_async:
+                self._track_retain_ops(resp, bank_id, wait=False)
+
+        self._enqueue_retain(lambda: self._write_to_banks(bank_ids, _write))
 
     def _enqueue_retain(self, job: Callable[[], None]) -> None:
         """Hand *job* to the (lazily started) writer and arm the atexit drain."""
@@ -1968,16 +2172,10 @@ class HindsightMemoryProvider(MemoryProvider):
         job = self._make_turn_retain_job(
             list(self._session_turns), document_id=document_id, update_mode=update_mode, label=label, track_ops=False
         )
-
-        def _flush() -> None:
-            try:
-                job()
-            except Exception as e:
-                logger.warning("Hindsight %s failed: %s", label, e, exc_info=True)
-
         # Same writer queue as sync_turn: FIFO behind queued retains, no two threads
-        # racing aretain_batch on one document, shutdown drain intact.
-        self._enqueue_retain(_flush)
+        # racing aretain_batch on one document, shutdown drain intact, and a failed flush
+        # resent like any other retain.
+        self._enqueue_retain(job)
 
     def on_session_switch(
         self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs

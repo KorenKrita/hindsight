@@ -22,6 +22,7 @@ from hindsight_api.engine.query_analyzer import DateparserQueryAnalyzer
 from hindsight_api.engine.task_backend import SyncTaskBackend
 from hindsight_api.engine.retain.fact_extraction import FactExtractionResponse, ExtractedFact
 from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
+from tests.consolidation_answers import fact_answer
 
 logger = logging.getLogger(__name__)
 
@@ -165,14 +166,10 @@ class TestLargeBatchRetain:
         call_tracker = {"count": 0, "facts": 0}
 
         async def mock_llm_call(*args, **kwargs):
-            from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
-
-            # Consolidation calls expect a _ConsolidationBatchResponse (not a raw dict),
+            # Consolidation calls expect a _FactBatchResponse (not a raw dict),
             # because consolidation does NOT use skip_validation=True.
             if kwargs.get("scope") == "consolidation":
-                return LLMCallResult(
-                    content=_ConsolidationBatchResponse(), usage=TokenUsage(input_tokens=0, output_tokens=0)
-                )
+                return LLMCallResult(content=fact_answer(), usage=TokenUsage(input_tokens=0, output_tokens=0))
 
             call_tracker["count"] += 1
 
@@ -231,20 +228,26 @@ class TestLargeBatchRetain:
                 raise
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(240)  # Increased timeout for VectorChord BM25 tokenization
-    async def test_batch_chunking_behavior(self, memory_with_mock_llm, request_context):
+    @pytest.mark.timeout(120)
+    async def test_batch_chunking_behavior(
+        self, memory_with_mock_llm, request_context, disable_observations, monkeypatch, caplog
+    ):
         """
-        Test that large batches are properly chunked into sub-batches.
+        Test that a batch over the token budget is split into sub-batches.
 
-        Verifies the CHARS_PER_BATCH (600k) chunking logic.
+        The budget is lowered rather than the content raised: splitting depends only on
+        total tokens > retain_batch_tokens, and every extra char is real embedding work
+        (#6332 — 50k chars plus consolidation timed out on CI and never reached the
+        default 10k-token budget anyway).
         """
+        from hindsight_api.config import _get_raw_config
+
+        monkeypatch.setattr(_get_raw_config(), "retain_batch_tokens", 500)
         memory = memory_with_mock_llm
         bank_id = f"chunk-test-{uuid.uuid4().hex[:8]}"
 
-        # Create contents that are moderately sized
-        # Testing the chunking behavior with smaller content
         num_items = 5
-        chars_per_item = 10_000  # 50k total
+        chars_per_item = 1_000  # ~250 tokens each, ~1.2k total: 2-3 sub-batches of 500
 
         contents = []
         for i in range(num_items):
@@ -260,12 +263,8 @@ class TestLargeBatchRetain:
         logger.info(f"Created {num_items} items with {actual_total_chars:,} chars (should trigger chunking)")
 
         async def mock_llm_call(*args, **kwargs):
-            from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
-
             if kwargs.get("scope") == "consolidation":
-                return LLMCallResult(
-                    content=_ConsolidationBatchResponse(), usage=TokenUsage(input_tokens=0, output_tokens=0)
-                )
+                return LLMCallResult(content=fact_answer(), usage=TokenUsage(input_tokens=0, output_tokens=0))
 
             messages = kwargs.get("messages", args[0] if args else [])
             user_msg = messages[-1]["content"] if messages else ""
@@ -274,6 +273,7 @@ class TestLargeBatchRetain:
 
             return LLMCallResult(content=response_dict, usage=TokenUsage(input_tokens=100, output_tokens=50))
 
+        caplog.set_level(logging.INFO, logger="hindsight_api.engine.memory_engine")
         with patch("hindsight_api.engine.llm_wrapper.LLMProvider.call", new=mock_llm_call):
             start_time = time.time()
 
@@ -288,6 +288,7 @@ class TestLargeBatchRetain:
 
             logger.info(f"Chunking test: {total_units} units in {elapsed:.2f}s")
 
+            assert "Large batch detected" in caplog.text, "the batch was not split into sub-batches"
             assert len(result) == num_items
             assert total_units > 0
 

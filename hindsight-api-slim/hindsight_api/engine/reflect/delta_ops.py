@@ -49,7 +49,7 @@ from typing import Annotated, Any, Literal, Union, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
-from hindsight_api.engine.llm_wrapper import ConfiguredLLMProvider, parse_llm_json
+from hindsight_api.engine.llm_wrapper import ConfiguredLLMProvider, parse_llm_json, reask_messages
 
 from .structured_doc import (
     Block,
@@ -58,6 +58,7 @@ from .structured_doc import (
     make_block_id,
     make_unique_id,
     normalize_block_text,
+    promote_embedded_headings,
     slugify_heading,
 )
 
@@ -76,6 +77,32 @@ class _OpBase(BaseModel):
     # error attached — see ``request_delta_operations`` — never to guess which
     # half of it was load-bearing.
     model_config = ConfigDict(extra="forbid")
+
+
+# Each op's docstring and the field descriptions below are its JSON-schema
+# description, which the model reads: the delta call appends the schema to the
+# system prompt (text mode, see the call site in ``memory_engine``). So they are
+# written for the model, about the mistakes it makes, and notes for readers of
+# this code go in comments. The old ones were notes for developers ("we slugify
+# the heading"); these name the mistakes replayed refresh replies made — a block
+# id copied into ``section_id``, a 9-character block id cut to 8, an
+# ``append_block`` given an ``after_block_id``, an op written as a bare list. The
+# gain measured over three replays of 92 prompts was small (about one more clean
+# reply), so the prompt, not this, carries the delta's quality.
+SectionId = Annotated[
+    str,
+    Field(
+        description="The id of a SECTION, copied exactly from CURRENT DOCUMENT. A section id is a slug of "
+        'its heading (e.g. "release-history"), never a block id.'
+    ),
+]
+BlockId = Annotated[
+    str,
+    Field(
+        description='The id of a BLOCK inside section_id, copied exactly from CURRENT DOCUMENT: "b" '
+        'followed by 8 hex characters (e.g. "b3f9a1c27"), all 9 characters.'
+    ),
+]
 
 
 def _coerce_block_texts(value: Any) -> Any:
@@ -104,51 +131,49 @@ def _coerce_block_texts(value: Any) -> Any:
 
 
 class AppendBlockOp(_OpBase):
-    """Add a new block at the end of an existing section."""
+    """Add a new block as the LAST block of a section. Takes no position: there is no after_block_id here (that is insert_block)."""
 
     op: Literal["append_block"] = "append_block"
-    section_id: str
+    section_id: SectionId
     text: str
 
 
 class InsertBlockOp(_OpBase):
-    """Insert a new block into an existing section.
+    """Add a new block directly after after_block_id, a block of the same section (null puts it first)."""
 
-    ``after_block_id`` names the block the new one follows; ``null`` puts it
-    first. An unknown id is a skip, not an append at a guessed position.
-    """
-
+    # An unknown after_block_id is a skip, not an append at a guessed position.
     op: Literal["insert_block"] = "insert_block"
-    section_id: str
-    after_block_id: str | None = None
+    section_id: SectionId
+    after_block_id: str | None = Field(
+        default=None,
+        description="The id of the BLOCK in section_id the new block follows, copied exactly (all 9 "
+        "characters), or null for first.",
+    )
     text: str
 
 
 class ReplaceBlockOp(_OpBase):
-    """Replace the text of one block, keeping its position and id."""
+    """Replace the text of one existing block; its position and id stay."""
 
     op: Literal["replace_block"] = "replace_block"
-    section_id: str
-    block_id: str
+    section_id: SectionId
+    block_id: BlockId
     text: str
 
 
 class RemoveBlockOp(_OpBase):
-    """Remove one block from a section."""
+    """Remove one existing block."""
 
     op: Literal["remove_block"] = "remove_block"
-    section_id: str
-    block_id: str
+    section_id: SectionId
+    block_id: BlockId
 
 
 class AddSectionOp(_OpBase):
-    """Add a brand-new section.
+    """Add a new section with its blocks, after after_section_id (an existing section's id) or at the end when omitted."""
 
-    ``after_section_id`` is optional; when omitted the new section is appended
-    at the end. ``new_id`` is optional; when omitted we slugify the heading
-    and disambiguate against existing IDs.
-    """
-
+    # ``new_id``, when omitted, is the heading slugified and disambiguated
+    # against the ids already in use.
     op: Literal["add_section"] = "add_section"
     heading: str
     level: int = Field(default=2, ge=1, le=6)
@@ -163,22 +188,19 @@ class AddSectionOp(_OpBase):
 
 
 class RemoveSectionOp(_OpBase):
-    """Remove an entire section by id."""
+    """Remove a whole section."""
 
     op: Literal["remove_section"] = "remove_section"
-    section_id: str
+    section_id: SectionId
 
 
 class ReplaceSectionBlocksOp(_OpBase):
-    """Replace all blocks of a section in one go.
+    """Replace every block of one section."""
 
-    Used when most of a section's contents are stale and rebuilding it as a
-    unit is clearer than emitting many block-level ops. The section's heading
-    and id are preserved.
-    """
-
+    # For a section whose contents are mostly stale, where rebuilding it as a
+    # unit is clearer than many block-level ops. Heading and id are preserved.
     op: Literal["replace_section_blocks"] = "replace_section_blocks"
-    section_id: str
+    section_id: SectionId
     blocks: list[str] = Field(default_factory=list)
 
     @field_validator("blocks", mode="before")
@@ -188,10 +210,10 @@ class ReplaceSectionBlocksOp(_OpBase):
 
 
 class RenameSectionOp(_OpBase):
-    """Rename a section's heading. The id is unchanged so future ops still resolve."""
+    """Change a section's heading; its id stays."""
 
     op: Literal["rename_section"] = "rename_section"
-    section_id: str
+    section_id: SectionId
     new_heading: str
 
 
@@ -264,7 +286,7 @@ def _validate_operations_list(raw_ops: Any) -> list[Operation]:
 
 
 class DeltaOperationList(BaseModel):
-    """Container for the operations produced by an LLM delta call."""
+    """The operations to apply, in order. Every item of operations is a JSON object whose "op" key names the operation, carrying exactly the keys of that operation."""
 
     model_config = ConfigDict(extra="forbid")
     operations: list[Operation] = Field(default_factory=list)
@@ -321,12 +343,30 @@ def _extract_balanced_json_object(text: str) -> str | None:
     return None
 
 
+def _operations_of(payload: dict[str, Any]) -> Any:
+    """The ``operations`` value, refusing a reply that put anything beside it.
+
+    A model sometimes writes an operation's keys at the top level, next to the
+    array, instead of as one more item inside it. Reading only ``operations`` used
+    to drop that operation without a word, so the edit it carried never landed under
+    a clean refresh. Refusing the reply sends it through the ask-again path, which
+    quotes this message back to the model.
+    """
+    stray = sorted(key for key in payload if key != "operations")
+    if stray:
+        raise ValueError(
+            f"the reply has top-level key(s) {stray} beside operations; every operation "
+            "must be one more object inside the operations array, never keys next to it"
+        )
+    return payload.get("operations", [])
+
+
 def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
     """Parse structured-delta LLM output into a validated operation list."""
     if isinstance(raw, DeltaOperationList):
         return raw
     if isinstance(raw, dict):
-        return DeltaOperationList(operations=_validate_operations_list(raw.get("operations", [])))
+        return DeltaOperationList(operations=_validate_operations_list(_operations_of(raw)))
     # A bare array reaches here parsed for the same reason the dict above does: the
     # delta call sets a ``response_format`` under ``skip_validation``, so the provider
     # returns the JSON it parsed. It is the same delta as the text-form array (#3820).
@@ -359,7 +399,7 @@ def parse_delta_operation_list(raw: Any) -> DeltaOperationList:
             last_error = ValueError("delta payload must be an object with an operations array")
             continue
         try:
-            operations = _validate_operations_list(payload["operations"])
+            operations = _validate_operations_list(_operations_of(payload))
         except TypeError as exc:
             last_error = exc
             continue
@@ -448,33 +488,6 @@ def _unreachable_correction_prompt(
     return "\n".join(lines)
 
 
-def _replayed_reply_text(content: Any) -> str:
-    """The refused reply as text, for the retry's assistant turn.
-
-    ``content`` is not necessarily the text the model wrote. A provider only
-    parses the body when the call set a ``response_format`` — a dict under
-    ``skip_validation``, the validated model otherwise — and the delta call site
-    sets one. Replaying that object unchanged put it in ``messages[N].content``,
-    which every strict request-body validator types as a string or a list of
-    content blocks, so the retry was refused with a 422 before it was ever sent;
-    the caller's own retry ladder then re-sent the identical body and the delta
-    was dropped under a refresh that reported success (#4965).
-
-    Serialized, not stringified, so the model reads back the document it wrote
-    rather than a repr of it; and passed through untouched when it already is
-    text, so a provider that returned text still sees the exact bytes it sent.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, BaseModel):
-        return content.model_dump_json()
-    if content is None:
-        return ""
-    if isinstance(content, (dict, list)):
-        return json.dumps(content, ensure_ascii=False)
-    return str(content)
-
-
 async def request_delta_operations(
     llm: ConfiguredLLMProvider,
     *,
@@ -505,7 +518,7 @@ async def request_delta_operations(
     prompt and the whole document stay a byte-identical prefix and the provider's
     prompt cache still covers them on the second call. The one appended turn the
     caller has to rebuild is the model's own reply, and it is rebuilt as text —
-    see ``_replayed_reply_text`` for why a parsed reply cannot be replayed as one.
+    see ``reask_messages`` for why a parsed reply cannot be replayed as one.
 
     ``document``, when given, also refuses a reply that parses but cannot fully
     land: an operation names a section or block the document does not have — all
@@ -541,12 +554,7 @@ async def request_delta_operations(
             len(op_list.operations),
         )
         correction = _unreachable_correction_prompt(unreachable, document, any_applied=bool(outcome.applied))
-    retry_messages = [
-        *messages,
-        {"role": "assistant", "content": _replayed_reply_text(first.content)},
-        {"role": "user", "content": correction},
-    ]
-    second = await llm.call(messages=retry_messages, scope=scope, **call_kwargs)
+    second = await llm.call(messages=reask_messages(messages, first.content, correction), scope=scope, **call_kwargs)
     return parse_delta_operation_list(second.content)
 
 
@@ -801,4 +809,4 @@ def apply_operations(
 
         skip(op, f"unhandled op type: {type(op).__name__}")  # pragma: no cover
 
-    return AppliedDelta(document=new_doc, applied=applied, skipped=skipped)
+    return AppliedDelta(document=promote_embedded_headings(new_doc, reserved_ids), applied=applied, skipped=skipped)

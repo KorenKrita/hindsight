@@ -7,6 +7,8 @@ efficient batch operations.
 import asyncio
 from datetime import datetime
 
+import asyncpg
+
 from .base import DatabaseConnection
 from .ops import (
     ChunkIdOwnedByAnotherBank,
@@ -21,6 +23,49 @@ from .ops import (
 )
 from .result import ResultRow
 
+# How long a bank create keeps trying to build its indexes before giving up (#5805).
+_INDEX_LOCK_BUDGET_SECONDS = 300.0
+
+
+async def _create_index_without_queueing(conn: DatabaseConnection, ddl: str) -> None:
+    """Run a plain CREATE INDEX on memory_units without parking in its lock queue.
+
+    The ShareLock it needs conflicts with every INSERT/UPDATE/DELETE, and Postgres
+    queues later lockers behind a waiting one. So while it waits — behind another bank
+    delete's DROP INDEX CONCURRENTLY, or a CONCURRENTLY build, both of which wait for
+    every older transaction to end — every write to memory_units, in every bank, waits
+    with it (#5805). Instead each attempt waits in a savepoint for at most twice
+    ``deadlock_timeout``, then leaves the queue and backs off so writers get through.
+
+    Twice, not less: a CONCURRENTLY build can be waiting on this very transaction, and
+    the deadlock detector only looks once a wait passes ``deadlock_timeout``. Waiting
+    past it keeps that cycle a DeadlockDetectedError, which the callers already retry
+    (#5830). The bank create itself still waits as long as the lock takes; callers
+    that cannot retry (import, a caller's own transaction) see no new failure short of
+    the budget, where the last lock error is raised.
+    """
+    deadline = asyncio.get_running_loop().time() + _INDEX_LOCK_BUDGET_SECONDS
+    delay = 0.1
+    while True:
+        try:
+            # Savepoint: a timed-out attempt rolls back alone, its lock wait and the
+            # local lock_timeout with it, and the caller's transaction carries on.
+            async with conn.transaction():
+                previous = await conn.fetchval("SELECT current_setting('lock_timeout')")
+                await conn.execute(
+                    "SELECT set_config('lock_timeout', (setting::int * 2)::text, true)"
+                    " FROM pg_settings WHERE name = 'deadlock_timeout'"
+                )
+                await conn.execute(ddl)
+                # A local setting outlives the savepoint's release; restore the caller's.
+                await conn.execute("SELECT set_config('lock_timeout', $1, true)", previous)
+            return
+        except asyncpg.LockNotAvailableError:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2.0)
+
 
 def pg_search_vector_expr(
     config,
@@ -34,7 +79,7 @@ def pg_search_vector_expr(
 
     Single source of truth shared by ``memory_units`` (the batch insert over the
     ``input_data`` CTE columns and the curation-revert recompute) and
-    ``mental_models`` (the knowledge-page writes), so the per-backend tokenization
+    ``mental_models`` (the page writes), so the per-backend tokenization
     can never drift between the two tables. Returns ``None`` for backends that
     leave ``search_vector`` unpopulated — pgroonga / pg_textsearch / pg_search
     index the base text columns directly and keep only a dummy column, so there is
@@ -297,7 +342,11 @@ class PostgreSQLOps(DataAccessOps):
                     LEAST(ml.from_unit_id, ml.to_unit_id),
                     GREATEST(ml.from_unit_id, ml.to_unit_id),
                     ml.link_type,
-                    COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid)
+                    COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid),
+                    -- Without this the key ties for a pair written both ways (x->y and
+                    -- y->x), so two writers could lock the pair's rows in opposite
+                    -- orders and deadlock (#6051). Must stay in step with retain.py.
+                    ml.from_unit_id
                 FOR UPDATE OF ml
             )
             DELETE FROM {table} ml
@@ -316,14 +365,13 @@ class PostgreSQLOps(DataAccessOps):
         sorted_links: list[tuple],
         bank_id: str,
         nil_entity_uuid: str,
-        exists_clause: str,
         chunk_size: int = 5000,
     ) -> None:
-        # exists_clause is unused on PostgreSQL: the memory_links → memory_units
-        # FKs are DEFERRABLE INITIALLY DEFERRED, so an INSERT takes no lock on the
-        # referenced parent rows until COMMIT — a concurrent committed DELETE in
-        # that window (consolidation pruning observations, document re-tracking)
-        # trips fk_memory_links_{to,from}_unit_id_memory_units at COMMIT (#1882),
+        # The memory_links → memory_units FKs are DEFERRABLE INITIALLY DEFERRED,
+        # so an INSERT takes no lock on the referenced parent rows until COMMIT —
+        # a concurrent committed DELETE in that window (consolidation pruning
+        # observations, document re-tracking) trips
+        # fk_memory_links_{to,from}_unit_id_memory_units at COMMIT (#1882),
         # and a WHERE EXISTS guard can't prevent it (the row passes the check,
         # then is deleted before the deferred check runs). Instead a CTE locks the
         # referenced units FOR KEY SHARE in the *same statement*: the lock blocks a
@@ -331,8 +379,8 @@ class PostgreSQLOps(DataAccessOps):
         # deferred check, and the INSERT only takes links whose endpoints are in
         # the locked set, so rows that already vanished are dropped. Folding it
         # into the one INSERT keeps this to a single round-trip — no extra query
-        # and no surrounding transaction needed. (Oracle's immediate FK has no
-        # such window and uses exists_clause via its own bulk_insert_links.)
+        # and no surrounding transaction needed. (Oracle's FK is immediate, so its
+        # own bulk_insert_links drops a vanished endpoint's link at insert time.)
         from ..schema import fq_store_table
 
         mu_table = fq_store_table("memory_units")
@@ -506,24 +554,18 @@ class PostgreSQLOps(DataAccessOps):
         # concurrent caller the same lock order, so conflicting inserts
         # queue cleanly instead of cycling.
         sorted_unit_ids = sorted(unit_ids)
-        # DO UPDATE (not DO NOTHING) on a duplicate enqueue — #3034. The SET is a
-        # deliberate no-op that preserves enqueued_at; its only purpose is to take
-        # the existing row's lock. DO NOTHING does NOT lock the conflicting row, so
-        # a mutation that re-enqueues an already-queued unit could not block a
-        # worker from concurrently claiming (deleting) that row and processing the
-        # unit's pre-mutation state; the re-enqueue signal was then silently lost
-        # and the unit's derived links stayed stale with an empty queue. Locking
-        # the row serialises the mutation against the worker's claim for that
-        # (bank_id, unit_id): the worker either waits for the committed post-mutation
-        # state, or (if it claimed first) this INSERT lands a fresh row after the
-        # worker's delete commits. Row locks are acquired in sorted unit_id order,
-        # matching claim_graph_maintenance_batch, so the two never cycle.
+        # DO UPDATE (not DO NOTHING) on a duplicate enqueue — #3034. It keeps
+        # enqueued_at and clears claimed_at, and it takes the row's lock. A worker
+        # relinking the unit right now loses its claim, so its finishing delete
+        # leaves the row queued and the next pass sees this mutation's state.
+        # Callers run this as the last statement before commit (#6417), and claims
+        # commit before the relink starts, so these locks are only held briefly.
         await conn.execute(
             f"""
             INSERT INTO {table} (bank_id, unit_id)
             SELECT $1, v FROM unnest($2::uuid[]) AS t(v)
             ON CONFLICT (bank_id, unit_id)
-                DO UPDATE SET enqueued_at = {table}.enqueued_at
+                DO UPDATE SET claimed_at = NULL
             """,
             bank_id,
             sorted_unit_ids,
@@ -535,22 +577,19 @@ class PostgreSQLOps(DataAccessOps):
         table: str,
         bank_id: str,
         limit: int,
+        claimed_at: datetime,
+        stale_before: datetime,
     ) -> list[str]:
-        # Ordered locking (#3034). Choose the oldest batch by enqueued_at, but
-        # acquire the row locks in (bank_id, unit_id) order — the same order the
-        # enqueue upsert takes them — so a foreground mutation re-enqueueing an
-        # overlapping unit set can never cycle against a worker draining it. The
-        # `chosen` CTE is MATERIALIZED so the enqueued_at pick is fenced from the
-        # locking clause; `FOR UPDATE OF q ... ORDER BY q.unit_id` then puts
-        # LockRows above the Sort, so locks are taken ascending by unit_id (same
-        # idiom as prune_stale_cooccurrences' #2529 ordered lock). A concurrent
-        # enqueue holding one of these rows blocks this claim until it commits, at
-        # which point the worker deletes and processes the committed state.
+        # Choose the oldest claimable batch by enqueued_at, then lock it in
+        # (bank_id, unit_id) order — the order the enqueue upsert takes them — so
+        # this short claim never cycles against a concurrent enqueue. MATERIALIZED
+        # fences the enqueued_at pick from the locking clause; SKIP LOCKED leaves
+        # a row being re-queued right now to the next claim.
         rows = await conn.fetch(
             f"""
             WITH chosen AS MATERIALIZED (
                 SELECT bank_id, unit_id FROM {table}
-                WHERE bank_id = $1
+                WHERE bank_id = $1 AND (claimed_at IS NULL OR claimed_at < $4)
                 ORDER BY enqueued_at
                 LIMIT $2
             ),
@@ -558,18 +597,36 @@ class PostgreSQLOps(DataAccessOps):
                 SELECT q.bank_id, q.unit_id
                 FROM {table} q
                 JOIN chosen c ON c.bank_id = q.bank_id AND c.unit_id = q.unit_id
+                WHERE q.claimed_at IS NULL OR q.claimed_at < $4
                 ORDER BY q.unit_id
-                FOR UPDATE OF q
+                FOR UPDATE OF q SKIP LOCKED
             )
-            DELETE FROM {table} q
-            USING locked l
+            UPDATE {table} q SET claimed_at = $3
+            FROM locked l
             WHERE q.bank_id = l.bank_id AND q.unit_id = l.unit_id
             RETURNING q.unit_id
             """,
             bank_id,
             limit,
+            claimed_at,
+            stale_before,
         )
         return [str(row["unit_id"]) for row in rows]
+
+    async def finish_graph_maintenance_batch(
+        self,
+        conn: DatabaseConnection,
+        table: str,
+        bank_id: str,
+        unit_ids: list[str],
+        claimed_at: datetime,
+    ) -> None:
+        await conn.execute(
+            f"DELETE FROM {table} WHERE bank_id = $1 AND unit_id = ANY($2::uuid[]) AND claimed_at = $3",
+            bank_id,
+            sorted(unit_ids),
+            claimed_at,
+        )
 
     async def release_entity_postings(
         self,
@@ -577,21 +634,67 @@ class PostgreSQLOps(DataAccessOps):
         queue_table: str,
         entities_table: str,
         ue_table: str,
+        units_table: str,
         bank_id: str,
         unit_ids: list,
     ) -> int:
+        # Four statements in the caller's transaction, deliberately not one
+        # (#6175). This used to be a single statement: the queue INSERT as a
+        # data-modifying CTE, feeding a FOR UPDATE scan of the entities and the
+        # UPDATE of their mention_count. When a concurrent transaction has just
+        # changed one of those entity rows — another retain crediting a mention,
+        # or a second append releasing the same old postings — Postgres
+        # re-checks the row (EvalPlanQual), and the re-check re-runs pieces of
+        # the plan that read the INSERT's output. Under concurrent appends that
+        # failed with "ModifyTable should not be called during EvalPlanQual" or
+        # "ON CONFLICT DO UPDATE command cannot affect row a second time". With
+        # the INSERT in a statement of its own, no re-check can reach it.
+        #
         # Read the candidates straight out of unit_entities rather than making
         # callers pass entity ids: every caller runs this immediately before the
-        # rows go, and the join they'd have to write is this one. `doomed` is
-        # that read, aggregated, so one scan serves both halves — the queue
-        # insert wants the ids, the mention release wants the counts.
+        # rows go, and the join they'd have to write is this one. The read is
+        # aggregated so one scan serves both halves — the queue insert wants the
+        # ids, the mention release wants the counts.
         #
-        # `enqueued`'s inner ORDER BY is load-bearing, not cosmetic: it makes the
-        # INSERT take the (bank_id, entity_id) row locks ascending, the same
-        # order claim_entity_maintenance_batch takes them, so a mutation
-        # enqueueing an overlapping candidate set cannot cycle against a worker
-        # draining it. (Same protocol as enqueue_graph_maintenance, which sorts
-        # in Python because its ids arrive as a bind array.)
+        # The memories are locked before their postings are read (#6229). Their
+        # postings are only ever removed by a transaction retiring the memory,
+        # and every one of those comes through here, so holding the memory row
+        # means no one else can change its postings until this commits. Without
+        # it, two transactions retiring one memory (two deletes, a delete racing
+        # a bulk delete) both counted its postings and both debited them, and
+        # two edits replacing its entities had the second clear postings the
+        # first had just written without counting them. Now the second waits
+        # here, and its read below — a new statement — sees what the first left.
+        #
+        # Ascending id, FOR NO KEY UPDATE: the order and strength the
+        # stale-observation sweep locks these same rows with, which runs before
+        # this on every path. NO KEY UPDATE still lets the relinker's FK
+        # KEY SHARE through while it holds queue rows our caller may enqueue
+        # next (see delete_stale_observations). Memory rows come first, then
+        # queue rows, then entity rows.
+        await conn.execute(
+            f"SELECT id FROM {units_table} WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE",
+            unit_ids,
+        )
+        doomed = await conn.fetch(
+            f"""
+            SELECT entity_id, COUNT(*) AS n
+            FROM {ue_table}
+            WHERE unit_id = ANY($1::uuid[])
+            GROUP BY entity_id
+            ORDER BY entity_id
+            """,
+            unit_ids,
+        )
+        if not doomed:
+            return 0
+        entity_ids = [row["entity_id"] for row in doomed]
+
+        # The ascending order is load-bearing, not cosmetic: it makes the INSERT
+        # take the (bank_id, entity_id) row locks ascending, the same order
+        # claim_entity_maintenance_batch takes them, so a mutation enqueueing an
+        # overlapping candidate set cannot cycle against a worker draining it.
+        # (Same protocol as enqueue_graph_maintenance.)
         #
         # DO UPDATE (not DO NOTHING) on a duplicate — #3034. The SET is a
         # deliberate no-op preserving enqueued_at; its only purpose is to lock
@@ -601,63 +704,43 @@ class PostgreSQLOps(DataAccessOps):
         # would find the entity still referenced, keep it, and the re-enqueue
         # signal would be lost, stranding the orphan until some later delete
         # happened to name it again.
+        await conn.execute(
+            f"""
+            INSERT INTO {queue_table} (bank_id, entity_id)
+            SELECT $1, v FROM unnest($2::uuid[]) AS t(v)
+            ON CONFLICT (bank_id, entity_id)
+                DO UPDATE SET enqueued_at = {queue_table}.enqueued_at
+            """,
+            bank_id,
+            entity_ids,
+        )
+
+        # Every queue row is now locked, so this transaction holds each
+        # entity's queue row before its `entities` row — the order the drain
+        # takes them in, so a delete and a worker draining the queue cannot
+        # deadlock. The entity locks themselves are taken ascending, the order
+        # restore_entity_postings and prune_orphan_entities use.
         #
-        # Both halves are one statement so the postings are counted in the scan
-        # that already lists them, but the two lock sets still have to be
-        # ordered or a delete and a worker draining the queue deadlock on the
-        # same entity. The invariant is: *an entity's queue row is locked before
-        # its own `entities` row, and queue rows are locked ascending.*
-        #
-        # `victims` referencing `enqueued` is what enforces the first half — an
-        # entity cannot become a victim until the INSERT has produced it. The
-        # second half is `enqueued`'s inner ORDER BY. Together they hold under
-        # every plan shape the statement gets: EXPLAIN picks a nested-loop semi
-        # join here (queue and entity locks interleave per entity, ascending)
-        # and a hashed subplan or a sort under LockRows on other row counts
-        # (every queue lock taken before the first entity lock). Both are safe,
-        # because taking an `entities` row lock always means already holding
-        # that entity's queue row, and the drain takes them in that same order.
-        #
-        # What is deliberately NOT relied on: the order `victims` produces rows
-        # in. `ORDER BY e.id` asks for ascending entity locks, but a lazily
-        # pulled semi join takes them in `doomed` order instead. That is fine
-        # for the reason above — the ascending queue locks are the serialiser,
-        # so two concurrent deletes cannot hold entity rows in opposing orders.
-        #
-        # `victims` re-filters on bank_id even though a posting cannot name
+        # The bank_id filter is not redundant even though a posting cannot name
         # another bank's entity: mention_count is denormalised state, and
         # scoping the write is what keeps that true if the invariant slips.
         result = await conn.execute(
             f"""
-            WITH doomed AS (
-                SELECT ue.entity_id AS id, COUNT(*) AS n
-                FROM {ue_table} ue
-                WHERE ue.unit_id = ANY($2::uuid[])
-                GROUP BY ue.entity_id
-            ),
-            enqueued AS (
-                INSERT INTO {queue_table} (bank_id, entity_id)
-                SELECT $1, s.id FROM (SELECT id FROM doomed ORDER BY 1) s
-                ON CONFLICT (bank_id, entity_id)
-                    DO UPDATE SET enqueued_at = {queue_table}.enqueued_at
-                RETURNING entity_id
-            ),
-            victims AS (
-                SELECT e.id, d.n
-                FROM {entities_table} e
-                JOIN doomed d ON d.id = e.id
-                WHERE e.bank_id = $1
-                  AND e.id IN (SELECT entity_id FROM enqueued)
-                ORDER BY e.id
-                FOR UPDATE OF e
-            )
             UPDATE {entities_table} e
             SET mention_count = GREATEST(e.mention_count - v.n, 0)
-            FROM victims v
+            FROM (
+                SELECT l.id, d.n
+                FROM {entities_table} l
+                JOIN unnest($2::uuid[], $3::bigint[]) AS d(id, n) ON d.id = l.id
+                WHERE l.bank_id = $1
+                ORDER BY l.id
+                FOR UPDATE OF l
+            ) v
             WHERE e.id = v.id
             """,
             bank_id,
-            unit_ids,
+            entity_ids,
+            [row["n"] for row in doomed],
         )
         # asyncpg returns "UPDATE N". Every posting names an existing entity in
         # this bank (FK, and postings are intra-bank by construction), so the
@@ -675,40 +758,51 @@ class PostgreSQLOps(DataAccessOps):
     ) -> int:
         if not entity_ids:
             return 0
-        # One statement, because crediting a mention for a posting that was not
-        # written would be the same bug in the other direction: `posted` returns
-        # exactly the rows the insert added, and only those are credited. Some
-        # of `entity_ids` may have been swept as orphans while the memory sat
-        # archived, which `survivors` filters out, and DO NOTHING covers a
-        # posting that somehow already exists.
+        # Crediting a mention for a posting that was not written would be the
+        # same bug in the other direction: only the postings the insert actually
+        # added are credited. Some of `entity_ids` may have been swept as
+        # orphans while the memory sat archived, which the lock below filters
+        # out, and DO NOTHING covers a posting that somehow already exists.
         #
-        # `survivors` locks the entity rows in ascending id order, the order
+        # Three statements, not one with a modifying CTE, for the reason given
+        # in release_entity_postings (#6175): a concurrent change to one of
+        # these entity rows makes Postgres re-check it, and a re-check must not
+        # reach an INSERT. Locking the survivors first also means the final
+        # UPDATE only touches rows this transaction already holds.
+        #
+        # The entity rows are locked in ascending id order, the order
         # release_entity_postings and prune_orphan_entities take them. No queue
         # row is involved here, so there is no second lock set to sequence.
-        result = await conn.execute(
+        survivors = await conn.fetch(
             f"""
-            WITH survivors AS (
-                SELECT e.id
-                FROM {entities_table} e
-                WHERE e.bank_id = $1
-                  AND e.id = ANY($3::uuid[])
-                ORDER BY e.id
-                FOR UPDATE
-            ),
-            posted AS (
-                INSERT INTO {ue_table} (unit_id, entity_id)
-                SELECT $2, s.id FROM survivors s
-                ON CONFLICT DO NOTHING
-                RETURNING entity_id
-            )
-            UPDATE {entities_table} e
-            SET mention_count = e.mention_count + 1
-            FROM posted p
-            WHERE e.id = p.entity_id
+            SELECT id
+            FROM {entities_table}
+            WHERE bank_id = $1
+              AND id = ANY($2::uuid[])
+            ORDER BY id
+            FOR UPDATE
             """,
             bank_id,
-            unit_id,
             entity_ids,
+        )
+        if not survivors:
+            return 0
+        posted = await conn.fetch(
+            f"""
+            INSERT INTO {ue_table} (unit_id, entity_id)
+            SELECT $1, v FROM unnest($2::uuid[]) AS t(v)
+            ON CONFLICT DO NOTHING
+            RETURNING entity_id
+            """,
+            unit_id,
+            [row["id"] for row in survivors],
+        )
+        if not posted:
+            return 0
+        result = await conn.execute(
+            f"UPDATE {entities_table} SET mention_count = mention_count + 1 WHERE bank_id = $1 AND id = ANY($2::uuid[])",
+            bank_id,
+            [row["entity_id"] for row in posted],
         )
         return int(result.split()[-1]) if isinstance(result, str) and result.startswith("UPDATE") else 0
 
@@ -1290,10 +1384,11 @@ class PostgreSQLOps(DataAccessOps):
             for ft, suffix in fact_types.items():
                 uid = str(internal_id).replace("-", "")[:16]
                 idx = f"idx_mu_emb_{suffix}_{uid}"
-                await conn.execute(
+                await _create_index_without_queueing(
+                    conn,
                     f"CREATE INDEX IF NOT EXISTS {idx} "
                     f"ON {table} {index_clause} "
-                    f"WHERE fact_type = '{ft}' AND bank_id = '{escaped}'"
+                    f"WHERE fact_type = '{ft}' AND bank_id = '{escaped}'",
                 )
 
     async def drop_bank_vector_indexes(
@@ -1640,7 +1735,7 @@ class PostgreSQLOps(DataAccessOps):
         if claimed_ids:
             return await conn.fetch(
                 f"""
-                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
                 FROM {table} o
                 WHERE o.status = 'pending'
                   AND o.task_payload IS NOT NULL
@@ -1657,7 +1752,7 @@ class PostgreSQLOps(DataAccessOps):
             )
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1698,7 +1793,7 @@ class PostgreSQLOps(DataAccessOps):
         extra = " AND ".join(conditions)
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1740,7 +1835,7 @@ class PostgreSQLOps(DataAccessOps):
         extra_clause = (" AND " + " AND ".join(conditions)) if conditions else ""
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1766,7 +1861,7 @@ class PostgreSQLOps(DataAccessOps):
         """
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1866,7 +1961,7 @@ class PostgreSQLOps(DataAccessOps):
                 SELECT * FROM rot UNION ALL SELECT * FROM fifo
             )
             SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count,
-                   o.serialization_key, o.bank_id, c.tier
+                   o.serialization_key, o.bank_id, o.created_at, c.tier
             FROM cand c
             JOIN {table} o ON o.operation_id = c.operation_id
             WHERE {claimable}

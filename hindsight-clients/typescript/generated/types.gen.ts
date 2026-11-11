@@ -551,6 +551,12 @@ export type BankStatsResponse = {
    * Total number of observations
    */
   total_observations?: number;
+  /**
+   * Paused Mental Models
+   *
+   * Number of mental models whose last refresh failed, so the automatic triggers (`refresh_after_consolidation`, `refresh_cron`, `full_refresh_cron`) skip them until an explicit refresh succeeds. Their content stops updating, so alert on this being above 0. Each model's `last_refresh_failed_at` says which ones, and its history says why.
+   */
+  paused_mental_models?: number;
 };
 
 /**
@@ -643,13 +649,13 @@ export type BankTemplateConfig = {
   /**
    * Mental Model Refresh Use Decision Model
    *
-   * The same, for knowledge-page refreshes
+   * The same, for page refreshes
    */
   mental_model_refresh_use_decision_model?: boolean | null;
   /**
    * Mental Model Delta Use Decision Model
    *
-   * When the server has a decision model, a delta knowledge-page refresh asks it which new memories could change the page instead of running reflect
+   * When the server has a decision model, a delta page refresh asks it which new memories could change the page instead of running reflect
    */
   mental_model_delta_use_decision_model?: boolean | null;
   /**
@@ -715,6 +721,12 @@ export type BankTemplateConfig = {
    */
   mcp_enabled_tools?: Array<string> | null;
   /**
+   * Knowledge Banks
+   *
+   * Knowledge banks whose passages this bank's reflect reads
+   */
+  knowledge_banks?: Array<string> | null;
+  /**
    * Consolidation Llm Batch Size
    *
    * LLM batch size for observation consolidation
@@ -771,9 +783,19 @@ export type BankTemplateConfig = {
    */
   reflect_source_facts_max_tokens?: number | null;
   /**
+   * Page Default Trigger
+   *
+   * Trigger fields merged over the built-in page default when a page is created (e.g. {"refresh_cron": "0 * * * *"}). A trigger sent with the create request still wins.
+   */
+  page_default_trigger?: {
+    [key: string]: unknown;
+  } | null;
+  /**
    * Knowledge Page Default Trigger
    *
-   * Trigger fields merged over the built-in knowledge-page default when a page is created (e.g. {"refresh_cron": "0 * * * *"}). A trigger sent with the create request still wins.
+   * Deprecated alias of page_default_trigger. Remove in 2.x.
+   *
+   * @deprecated
    */
   knowledge_page_default_trigger?: {
     [key: string]: unknown;
@@ -781,7 +803,7 @@ export type BankTemplateConfig = {
   /**
    * Reflect Default Options
    *
-   * Default reflect options for this bank (e.g. {"reflect_search_observations_max_tokens": 3000, "reflect_search_observations_include_entities": false}). Applied to every reflect in the bank -- API, MCP and mental-model refresh -- whenever the request (or the model's trigger) leaves the option unset.
+   * Default reflect options for this bank (e.g. {"reflect_search_observations_max_tokens": 3000, "reflect_search_observations_include_entities": false}). Applied to every reflect request in the bank (API and MCP) that leaves the option unset. Mental-model refreshes do not read it: they take these options from their own trigger, defaulted per bank by page_default_trigger.
    */
   reflect_default_options?: {
     [key: string]: unknown;
@@ -865,6 +887,12 @@ export type BankTemplateConfig = {
    */
   store_document_text?: boolean | null;
   /**
+   * Default Timezone
+   *
+   * IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, is read in when it carries no UTC offset.
+   */
+  default_timezone?: string | null;
+  /**
    * Enable Auto Consolidation
    *
    * Automatically consolidate observations after retain
@@ -873,7 +901,7 @@ export type BankTemplateConfig = {
   /**
    * Consolidation Use Decision Model
    *
-   * When the server has a decision model, consolidation lets it settle restatements, new facets and chatter before the LLM call
+   * When the server has a decision model, consolidation lets it settle restatements and chatter before the LLM call
    */
   consolidation_use_decision_model?: boolean | null;
   /**
@@ -900,6 +928,18 @@ export type BankTemplateConfig = {
    * Default for recall prefer_observations when the request omits it
    */
   recall_prefer_observations?: boolean | null;
+  /**
+   * Recall Decision Model Prune
+   *
+   * Default for recall prune when the request omits it (decision-model reranker only)
+   */
+  recall_decision_model_prune?: boolean | null;
+  /**
+   * Recall Decision Model Dedup
+   *
+   * Default for recall dedup when the request omits it (decision-model reranker only)
+   */
+  recall_decision_model_dedup?: boolean | null;
   /**
    * Recall Max Tokens
    *
@@ -1061,7 +1101,7 @@ export type BankTemplateMentalModel = {
   /**
    * Id
    *
-   * Unique ID for the mental model (alphanumeric lowercase with hyphens)
+   * Unique ID for the mental model (same rules as a bank id: at most 192 bytes of UTF-8, no '/' and no control characters)
    */
   id: string;
   /**
@@ -1555,7 +1595,7 @@ export type CreateBankAliasRequest = {
   /**
    * Alias
    *
-   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters, no leading underscore), and it must not already name a bank or another alias.
+   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no '/', no control characters, no leading underscore), and it must not already name a bank or another alias.
    */
   alias: string;
   /**
@@ -1669,7 +1709,7 @@ export type CreateBankRequest = {
   /**
    * Enable Text Search
    *
-   * Toggle the keyword (BM25) retrieval arm during recall. Disabling leaves pure vector search: the arm is left out of the query entirely rather than filtered to nothing, so none of its cost is paid. Also drops the keyword arm from knowledge-page search.
+   * Toggle the keyword (BM25) retrieval arm during recall. Disabling leaves pure vector search: the arm is left out of the query entirely rather than filtered to nothing, so none of its cost is paid. Also drops the keyword arm from page search.
    */
   enable_text_search?: boolean | null;
   /**
@@ -1747,26 +1787,6 @@ export type CreateFolderRequest = {
 };
 
 /**
- * CreateKnowledgePageResponse
- *
- * Result of creating a page: the node id, its mental model, and the refresh op.
- */
-export type CreateKnowledgePageResponse = {
-  /**
-   * Page Id
-   */
-  page_id: string;
-  /**
-   * Mental Model Id
-   */
-  mental_model_id: string;
-  /**
-   * Operation Id
-   */
-  operation_id?: string | null;
-};
-
-/**
  * CreateMentalModelRequest
  *
  * Request model for creating a mental model.
@@ -1775,7 +1795,7 @@ export type CreateMentalModelRequest = {
   /**
    * Id
    *
-   * Optional custom ID for the mental model (alphanumeric lowercase with hyphens)
+   * Optional custom ID for the mental model (same rules as a bank id: at most 192 bytes of UTF-8, no '/' and no control characters)
    */
   id?: string | null;
   /**
@@ -1857,6 +1877,26 @@ export type CreatePageRequest = {
    */
   max_tokens?: number | null;
   trigger?: MentalModelTriggerInput | null;
+};
+
+/**
+ * CreatePageResponse
+ *
+ * Result of creating a page: the node id, its mental model, and the refresh op.
+ */
+export type CreatePageResponse = {
+  /**
+   * Page Id
+   */
+  page_id: string;
+  /**
+   * Mental Model Id
+   */
+  mental_model_id: string;
+  /**
+   * Operation Id
+   */
+  operation_id?: string | null;
 };
 
 /**
@@ -2123,7 +2163,7 @@ export type DocumentEvent = {
  * DocumentEventKind
  *
  * What a change was. A named enum, not a Literal: inline enums are named after their field by
- * the generated Rust client, and ``kind`` already names the knowledge-base node enum there.
+ * the generated Rust client, and ``kind`` already names the page node enum there.
  */
 export type DocumentEventKind =
   | "retain"
@@ -2934,6 +2974,12 @@ export type FeaturesInfo = {
    */
   document_import_api: boolean;
   /**
+   * Knowledge Banks
+   *
+   * Whether knowledge banks are enabled
+   */
+  knowledge_banks?: boolean;
+  /**
    * Audit Log
    *
    * Whether audit logging is enabled by default (overridable per bank)
@@ -3058,230 +3104,6 @@ export type IncludeOptions = {
    * Include source facts for observation-type results. Set to {} to enable, null to disable (default: disabled).
    */
   source_facts?: SourceFactsIncludeOptions | null;
-};
-
-/**
- * KnowledgeNode
- *
- * A node in the knowledge-base tree — a folder or a page.
- *
- * Pages carry ``description``/``tags`` from their backing mental model. The
- * knowledge base is client-managed (CRUD); ``managed`` lets a client tag a node
- * as system-owned vs. hand-authored.
- */
-export type KnowledgeNode = {
-  /**
-   * Id
-   */
-  id: string;
-  /**
-   * Kind
-   */
-  kind: "folder" | "page";
-  /**
-   * Name
-   */
-  name: string;
-  /**
-   * Parent Id
-   */
-  parent_id?: string | null;
-  /**
-   * Mental Model Id
-   *
-   * Backing mental model id (pages only).
-   */
-  mental_model_id?: string | null;
-  /**
-   * Managed
-   *
-   * Client-set flag: true = system-owned, false = hand-authored.
-   */
-  managed?: boolean;
-  /**
-   * Description
-   *
-   * Page source query (the page's `description`).
-   */
-  description?: string | null;
-  /**
-   * Tags
-   */
-  tags?: Array<string>;
-  /**
-   * Timestamp
-   *
-   * Last refresh (page) or last update (folder).
-   */
-  timestamp?: string | null;
-  /**
-   * Is Stale
-   *
-   * Pages only, populated by the tree endpoint. True when a memory in *this page's* scope — its tags and fact types — has been written since the page last read the memories. That is the same check a scheduled refresh runs before spending an LLM call, so a flagged page is one a refresh would actually rewrite. Deletions are not observed: removing an in-scope memory leaves no write behind, so it does not raise this flag.
-   */
-  is_stale?: boolean | null;
-  /**
-   * Last Refresh Failed At
-   *
-   * Pages only: when this page's most recent refresh failed, in ISO format, or null when the last one succeeded. While it is set the page does not rebuild itself on its trigger — see the same field on the mental model. An explicit refresh still runs.
-   */
-  last_refresh_failed_at?: string | null;
-  /**
-   * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`, plus any `full_refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
-   */
-  trigger?: MentalModelTriggerOutput | null;
-  /**
-   * Children
-   */
-  children?: Array<KnowledgeNode>;
-};
-
-/**
- * KnowledgePageBundleFile
- *
- * One file in a portable markdown bundle.
- */
-export type KnowledgePageBundleFile = {
-  /**
-   * Path
-   */
-  path: string;
-  /**
-   * Content
-   */
-  content: string;
-};
-
-/**
- * KnowledgePageBundleResponse
- *
- * A portable markdown bundle — a flat set of markdown files (index + pages + logs).
- */
-export type KnowledgePageBundleResponse = {
-  /**
-   * Files
-   */
-  files: Array<KnowledgePageBundleFile>;
-};
-
-/**
- * KnowledgePageResponse
- *
- * A knowledge page rendered as a markdown document.
- */
-export type KnowledgePageResponse = {
-  /**
-   * Id
-   */
-  id: string;
-  /**
-   * Name
-   */
-  name: string;
-  /**
-   * Type
-   *
-   * Page type — from a `type:<x>` tag, else 'knowledge-page'.
-   */
-  type: string;
-  /**
-   * Description
-   *
-   * The source query that rebuilds the page.
-   */
-  description?: string | null;
-  /**
-   * Tags
-   */
-  tags?: Array<string>;
-  /**
-   * Timestamp
-   *
-   * Last refresh time (falls back to creation).
-   */
-  timestamp?: string | null;
-  /**
-   * Body
-   *
-   * The page's synthesized markdown body, exactly as stored. Empty until a refresh writes one — unlike `markdown`, which says so in words. Build a UI's own empty state off this field; read `markdown` to show the document itself.
-   */
-  body?: string | null;
-  /**
-   * Markdown
-   *
-   * The full markdown document: YAML frontmatter + markdown body. A page with no body yet renders 'No content yet.' as its body rather than frontmatter alone, which reads as a page that failed to render. The notice is added here on the way out; the stored body in `body` stays empty, and the export bundle keeps the bare document.
-   */
-  markdown: string;
-};
-
-/**
- * KnowledgePageSearchResponse
- *
- * Ranked knowledge-page search results (BM25 + vector, RRF-fused).
- */
-export type KnowledgePageSearchResponse = {
-  /**
-   * Results
-   */
-  results: Array<KnowledgePageSearchResult>;
-  /**
-   * Total
-   */
-  total: number;
-};
-
-/**
- * KnowledgePageSearchResult
- *
- * One hybrid-search hit: a knowledge page and its fused relevance score.
- */
-export type KnowledgePageSearchResult = {
-  /**
-   * Id
-   */
-  id: string;
-  /**
-   * Name
-   */
-  name: string;
-  /**
-   * Mental Model Id
-   */
-  mental_model_id?: string | null;
-  /**
-   * Source Query
-   *
-   * The question the page answers.
-   */
-  source_query?: string | null;
-  /**
-   * Snippet
-   *
-   * The page's opening text. A page whose body is still empty says so in words — 'No content yet.' — rather than coming back blank, so a caller can tell an unwritten page from a page whose snippet simply did not render. The marker is produced on the way out; the stored body stays empty and out of the search index.
-   */
-  snippet: string;
-  /**
-   * Score
-   *
-   * Rank-fusion score in 0..1, where 1.0 means every search arm placed this page first. It reflects where the page ranked for this query, not how well its text matched, so it is only comparable within one result set.
-   */
-  score: number;
-  /**
-   * Updated At
-   */
-  updated_at?: string | null;
-};
-
-/**
- * KnowledgeTreeResponse
- *
- * The knowledge base as a nested folder/page tree.
- */
-export type KnowledgeTreeResponse = {
-  /**
-   * Roots
-   */
-  roots: Array<KnowledgeNode>;
 };
 
 /**
@@ -3434,6 +3256,26 @@ export type LlmRequestListResponse = {
    * Items
    */
   items: Array<LlmRequestEntry>;
+  /**
+   * Retention Days
+   */
+  retention_days?: number | null;
+};
+
+/**
+ * LLMRequestSeriesSums
+ *
+ * Calls and tokens (total + reasoning) of one model or operation within a time bucket.
+ */
+export type LlmRequestSeriesSums = {
+  /**
+   * Calls
+   */
+  calls: number;
+  /**
+   * Tokens
+   */
+  tokens: number;
 };
 
 /**
@@ -3457,6 +3299,12 @@ export type LlmRequestStatsBucket = {
    */
   total: number;
   tokens: LlmRequestTokenSums;
+  /**
+   * Series
+   */
+  series?: {
+    [key: string]: LlmRequestSeriesSums;
+  } | null;
 };
 
 /**
@@ -3485,6 +3333,10 @@ export type LlmRequestStatsResponse = {
    * Buckets
    */
   buckets: Array<LlmRequestStatsBucket>;
+  /**
+   * Retention Days
+   */
+  retention_days?: number | null;
 };
 
 /**
@@ -4784,15 +4636,23 @@ export type MentalModelResponse = {
    */
   created_at?: string | null;
   /**
+   * Is Page
+   *
+   * True when this model holds a page's content rather than being a standalone mental model. Set by the list and get endpoints.
+   */
+  is_page?: boolean | null;
+  /**
    * Is Knowledge Page
    *
-   * True when this model holds a knowledge page's content rather than being a standalone mental model. Set by the list and get endpoints.
+   * Deprecated: use is_page.
+   *
+   * @deprecated
    */
   is_knowledge_page?: boolean | null;
   /**
    * Reflect Response
    *
-   * Full reflect API response payload including based_on facts and observations
+   * Full reflect API response payload including based_on facts and observations. On a single-model read, each world/experience/observation entry in based_on also carries `attachments`: the retained images and files that memory was extracted from.
    */
   reflect_response?: {
     [key: string]: unknown;
@@ -4917,7 +4777,7 @@ export type MentalModelTraceToolCall = {
  * whole document, so it wants its own retrieval and iteration settings. This
  * trigger is therefore the only source for them — a bank's
  * ``reflect_default_options`` deliberately does not reach a refresh. The
- * per-bank default for these fields is ``knowledge_page_default_trigger``,
+ * per-bank default for these fields is ``page_default_trigger``,
  * which is merged over this same shape when a page is created.
  */
 export type MentalModelTriggerInput = {
@@ -5040,7 +4900,7 @@ export type MentalModelTriggerInput = {
  * whole document, so it wants its own retrieval and iteration settings. This
  * trigger is therefore the only source for them — a bank's
  * ``reflect_default_options`` deliberately does not reach a refresh. The
- * per-bank default for these fields is ``knowledge_page_default_trigger``,
+ * per-bank default for these fields is ``page_default_trigger``,
  * which is merged over this same shape when a page is created.
  */
 export type MentalModelTriggerOutput = {
@@ -5202,7 +5062,7 @@ export type MinScores = {
   /**
    * Reranker
    *
-   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result. Rejected with HTTP 400 when the reranker scores by rank position (TypeSafe), since a floor would only keep a fixed share of the results.
+   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result. Rejected with HTTP 400 when the reranker scores by rank position (a decision model, or TypeSafe), since a floor would only keep a fixed share of the results.
    */
   reranker?: number | null;
   /**
@@ -5538,6 +5398,230 @@ export type OperationsListResponse = {
 };
 
 /**
+ * PageBundleFile
+ *
+ * One file in a portable markdown bundle.
+ */
+export type PageBundleFile = {
+  /**
+   * Path
+   */
+  path: string;
+  /**
+   * Content
+   */
+  content: string;
+};
+
+/**
+ * PageBundleResponse
+ *
+ * A portable markdown bundle — a flat set of markdown files (index + pages + logs).
+ */
+export type PageBundleResponse = {
+  /**
+   * Files
+   */
+  files: Array<PageBundleFile>;
+};
+
+/**
+ * PageNode
+ *
+ * A node in the page tree — a folder or a page.
+ *
+ * Pages carry ``description``/``tags`` from their backing mental model. The
+ * pages is client-managed (CRUD); ``managed`` lets a client tag a node
+ * as system-owned vs. hand-authored.
+ */
+export type PageNode = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Kind
+   */
+  kind: "folder" | "page";
+  /**
+   * Name
+   */
+  name: string;
+  /**
+   * Parent Id
+   */
+  parent_id?: string | null;
+  /**
+   * Mental Model Id
+   *
+   * Backing mental model id (pages only).
+   */
+  mental_model_id?: string | null;
+  /**
+   * Managed
+   *
+   * Client-set flag: true = system-owned, false = hand-authored.
+   */
+  managed?: boolean;
+  /**
+   * Description
+   *
+   * Page source query (the page's `description`).
+   */
+  description?: string | null;
+  /**
+   * Tags
+   */
+  tags?: Array<string>;
+  /**
+   * Timestamp
+   *
+   * Last refresh (page) or last update (folder).
+   */
+  timestamp?: string | null;
+  /**
+   * Is Stale
+   *
+   * Pages only, populated by the tree endpoint. True when a memory in *this page's* scope — its tags and fact types — has been written since the page last read the memories. That is the same check a scheduled refresh runs before spending an LLM call, so a flagged page is one a refresh would actually rewrite. Deletions are not observed: removing an in-scope memory leaves no write behind, so it does not raise this flag.
+   */
+  is_stale?: boolean | null;
+  /**
+   * Last Refresh Failed At
+   *
+   * Pages only: when this page's most recent refresh failed, in ISO format, or null when the last one succeeded. While it is set the page does not rebuild itself on its trigger — see the same field on the mental model. An explicit refresh still runs.
+   */
+  last_refresh_failed_at?: string | null;
+  /**
+   * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`, plus any `full_refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
+   */
+  trigger?: MentalModelTriggerOutput | null;
+  /**
+   * Children
+   */
+  children?: Array<PageNode>;
+};
+
+/**
+ * PageResponse
+ *
+ * A page rendered as a markdown document.
+ */
+export type PageResponse = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Name
+   */
+  name: string;
+  /**
+   * Type
+   *
+   * Page type — from a `type:<x>` tag, else 'page'.
+   */
+  type: string;
+  /**
+   * Description
+   *
+   * The source query that rebuilds the page.
+   */
+  description?: string | null;
+  /**
+   * Tags
+   */
+  tags?: Array<string>;
+  /**
+   * Timestamp
+   *
+   * Last refresh time (falls back to creation).
+   */
+  timestamp?: string | null;
+  /**
+   * Body
+   *
+   * The page's synthesized markdown body, exactly as stored. Empty until a refresh writes one — unlike `markdown`, which says so in words. Build a UI's own empty state off this field; read `markdown` to show the document itself.
+   */
+  body?: string | null;
+  /**
+   * Markdown
+   *
+   * The full markdown document: YAML frontmatter + markdown body. A page with no body yet renders 'No content yet.' as its body rather than frontmatter alone, which reads as a page that failed to render. The notice is added here on the way out; the stored body in `body` stays empty, and the export bundle keeps the bare document.
+   */
+  markdown: string;
+};
+
+/**
+ * PageSearchResponse
+ *
+ * Ranked page search results (BM25 + vector, RRF-fused).
+ */
+export type PageSearchResponse = {
+  /**
+   * Results
+   */
+  results: Array<PageSearchResult>;
+  /**
+   * Total
+   */
+  total: number;
+};
+
+/**
+ * PageSearchResult
+ *
+ * One hybrid-search hit: a page and its fused relevance score.
+ */
+export type PageSearchResult = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Name
+   */
+  name: string;
+  /**
+   * Mental Model Id
+   */
+  mental_model_id?: string | null;
+  /**
+   * Source Query
+   *
+   * The question the page answers.
+   */
+  source_query?: string | null;
+  /**
+   * Snippet
+   *
+   * The page's opening text. A page whose body is still empty says so in words — 'No content yet.' — rather than coming back blank, so a caller can tell an unwritten page from a page whose snippet simply did not render. The marker is produced on the way out; the stored body stays empty and out of the search index.
+   */
+  snippet: string;
+  /**
+   * Score
+   *
+   * Rank-fusion score in 0..1, where 1.0 means every search arm placed this page first. It reflects where the page ranked for this query, not how well its text matched, so it is only comparable within one result set.
+   */
+  score: number;
+  /**
+   * Updated At
+   */
+  updated_at?: string | null;
+};
+
+/**
+ * PageTreeResponse
+ *
+ * The pages as a nested folder/page tree.
+ */
+export type PageTreeResponse = {
+  /**
+   * Roots
+   */
+  roots: Array<PageNode>;
+};
+
+/**
  * PromptBlockModel
  *
  * One block of a message: its text, and the setting that decides it.
@@ -5735,6 +5819,10 @@ export type RecallRequest = {
    * When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. When omitted, uses the bank/global recall_prefer_observations config (false unless configured). No effect unless 'observation' and at least one raw type are both requested.
    */
   prefer_observations?: boolean | null;
+  /**
+   * What the decision-model reranker does beyond ordering: drop results that do not help (`prune`) or that repeat a better-ranked one (`dedup`). Each field left unset uses the bank/global config. No effect unless a decision model is set up for recall.
+   */
+  rerank?: RerankOptions | null;
   budget?: Budget;
   /**
    * Max Tokens
@@ -6144,6 +6232,12 @@ export type ReflectRequest = {
    */
   reflect_search_observations_include_entities?: boolean | null;
   /**
+   * Reflect Search Mental Models Max Tokens
+   *
+   * Token budget for the mental models search_mental_models returns in full, packed in rank order. The best-ranked one is always in full; the others that do not fit come back as a snippet the model can read with read_mental_models. Raise it for banks with long pages or answers spread across pages; lower it to cut the reflect context. None means use the shipped default (16000).
+   */
+  reflect_search_mental_models_max_tokens?: number | null;
+  /**
    * Query
    */
   query: string;
@@ -6353,6 +6447,7 @@ export type RefreshMentalModelOperationDetails = {
     | "refresh_failed_empty_candidate"
     | "refresh_failed_delta_not_applied"
     | "refresh_failed_structured_output"
+    | "refresh_failed_candidate_rejected"
     | "refresh_failed_error";
   /**
    * Failure Reason
@@ -6366,6 +6461,7 @@ export type RefreshMentalModelOperationDetails = {
     | "delta_ops_all_skipped"
     | "delta_not_applied"
     | "structured_output_failed"
+    | "candidate_rejected"
     | "retrieval_failed"
     | "no_answer"
     | "unexpected_error"
@@ -6404,6 +6500,27 @@ export type ReprocessDocumentResponse = {
    * Items Count
    */
   items_count: number;
+};
+
+/**
+ * RerankOptions
+ *
+ * What the decision-model reranker does beyond ordering. Each field left unset (null) uses the
+ * bank/global config; neither has any effect unless a decision model is set up for recall.
+ */
+export type RerankOptions = {
+  /**
+   * Prune
+   *
+   * Drop the results the decision model judges no help to the query, instead of only ranking them last. Costs no extra request. When omitted, uses the bank/global recall_decision_model_prune config (false unless configured).
+   */
+  prune?: boolean | null;
+  /**
+   * Dedup
+   *
+   * Drop a result that repeats a better-ranked one, so the same fact comes back once. Costs one more decision-model request after the ranking one. When omitted, uses the bank/global recall_decision_model_dedup config (false unless configured).
+   */
+  dedup?: boolean | null;
 };
 
 /**
@@ -6925,9 +7042,21 @@ export type UpdateDocumentRequest = {
   /**
    * Tags
    *
-   * The complete new set of tags for the document and its memory units — this REPLACES the existing tags rather than adding to them, so omitting a tag drops it and `[]` clears them all. Triggers observation invalidation and re-consolidation.
+   * The complete new set of tags for the document and its memory units — this REPLACES the existing tags rather than adding to them, so omitting a tag drops it and `[]` clears them all. Triggers observation invalidation and re-consolidation. To change only some tags, use `add_tags` / `remove_tags` instead.
    */
   tags?: Array<string> | null;
+  /**
+   * Add Tags
+   *
+   * Tags to add to the document, keeping the ones it has. Cannot be combined with `tags`.
+   */
+  add_tags?: Array<string> | null;
+  /**
+   * Remove Tags
+   *
+   * Tags to remove from the document, keeping the rest (applied before `add_tags`). Cannot be combined with `tags`. Tags a memory carries from an entity label group with `tag: true` stay on that memory.
+   */
+  remove_tags?: Array<string> | null;
   /**
    * UpdateDocumentObservationScopes
    *
@@ -8353,9 +8482,17 @@ export type ListMentalModelsData = {
      */
     offset?: number;
     /**
+     * Exclude Pages
+     *
+     * Leave out the mental models that hold page content (list standalone models only).
+     */
+    exclude_pages?: boolean;
+    /**
      * Exclude Knowledge Pages
      *
-     * Leave out the mental models that hold knowledge page content (list standalone models only).
+     * Deprecated: use exclude_pages.
+     *
+     * @deprecated
      */
     exclude_knowledge_pages?: boolean;
   };
@@ -8767,11 +8904,70 @@ export type GetKnowledgeBaseTreeResponses = {
   /**
    * Successful Response
    */
-  200: KnowledgeTreeResponse;
+  200: PageTreeResponse;
 };
 
 export type GetKnowledgeBaseTreeResponse =
   GetKnowledgeBaseTreeResponses[keyof GetKnowledgeBaseTreeResponses];
+
+export type GetPageTreeData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: {
+    /**
+     * Tags
+     *
+     * Only return pages carrying these tags (matched per `tags_match`, like recall).
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match a page's tags: any, all, any_strict, all_strict, exact. 'any'/'all' also return untagged pages; the _strict modes and 'exact' do not.
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * JSON-encoded compound tag filter, same shape as recall's `tag_groups`, e.g. `[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. Top-level groups are AND-ed, and AND-ed with `tags`.
+     */
+    tag_groups?: string | null;
+  };
+  url: "/v1/default/banks/{bank_id}/pages/tree";
+};
+
+export type GetPageTreeErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetPageTreeError = GetPageTreeErrors[keyof GetPageTreeErrors];
+
+export type GetPageTreeResponses = {
+  /**
+   * Successful Response
+   */
+  200: PageTreeResponse;
+};
+
+export type GetPageTreeResponse = GetPageTreeResponses[keyof GetPageTreeResponses];
 
 export type CreateKnowledgeFolderData = {
   body: CreateFolderRequest;
@@ -8805,11 +9001,47 @@ export type CreateKnowledgeFolderResponses = {
   /**
    * Successful Response
    */
-  201: KnowledgeNode;
+  201: PageNode;
 };
 
 export type CreateKnowledgeFolderResponse =
   CreateKnowledgeFolderResponses[keyof CreateKnowledgeFolderResponses];
+
+export type CreatePageFolderData = {
+  body: CreateFolderRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/pages/folders";
+};
+
+export type CreatePageFolderErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type CreatePageFolderError = CreatePageFolderErrors[keyof CreatePageFolderErrors];
+
+export type CreatePageFolderResponses = {
+  /**
+   * Successful Response
+   */
+  201: PageNode;
+};
+
+export type CreatePageFolderResponse = CreatePageFolderResponses[keyof CreatePageFolderResponses];
 
 export type CreateKnowledgePageData = {
   body: CreatePageRequest;
@@ -8842,11 +9074,47 @@ export type CreateKnowledgePageResponses = {
   /**
    * Successful Response
    */
-  201: CreateKnowledgePageResponse;
+  201: CreatePageResponse;
 };
 
-export type CreateKnowledgePageResponse2 =
+export type CreateKnowledgePageResponse =
   CreateKnowledgePageResponses[keyof CreateKnowledgePageResponses];
+
+export type CreatePageData = {
+  body: CreatePageRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/pages";
+};
+
+export type CreatePageErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type CreatePageError = CreatePageErrors[keyof CreatePageErrors];
+
+export type CreatePageResponses = {
+  /**
+   * Successful Response
+   */
+  201: CreatePageResponse;
+};
+
+export type CreatePageResponse2 = CreatePageResponses[keyof CreatePageResponses];
 
 export type ExportKnowledgeBaseData = {
   body?: never;
@@ -8883,11 +9151,51 @@ export type ExportKnowledgeBaseResponses = {
   /**
    * Successful Response
    */
-  200: KnowledgePageBundleResponse;
+  200: PageBundleResponse;
 };
 
 export type ExportKnowledgeBaseResponse =
   ExportKnowledgeBaseResponses[keyof ExportKnowledgeBaseResponses];
+
+export type ExportPagesData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/pages/export";
+};
+
+export type ExportPagesErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ExportPagesError = ExportPagesErrors[keyof ExportPagesErrors];
+
+export type ExportPagesResponses = {
+  /**
+   * Successful Response
+   */
+  200: PageBundleResponse;
+};
+
+export type ExportPagesResponse = ExportPagesResponses[keyof ExportPagesResponses];
 
 export type SearchKnowledgeBaseData = {
   body?: never;
@@ -8955,11 +9263,82 @@ export type SearchKnowledgeBaseResponses = {
   /**
    * Successful Response
    */
-  200: KnowledgePageSearchResponse;
+  200: PageSearchResponse;
 };
 
 export type SearchKnowledgeBaseResponse =
   SearchKnowledgeBaseResponses[keyof SearchKnowledgeBaseResponses];
+
+export type SearchPagesData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query: {
+    /**
+     * Q
+     *
+     * Search query
+     */
+    q: string;
+    /**
+     * Limit
+     *
+     * Maximum results to return
+     */
+    limit?: number;
+    /**
+     * Tags
+     *
+     * Only return pages carrying these tags (matched per `tags_match`, like recall).
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match a page's tags: any, all, any_strict, all_strict, exact. 'any'/'all' also return untagged pages; the _strict modes and 'exact' do not.
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * JSON-encoded compound tag filter, same shape as recall's `tag_groups`, e.g. `[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. Top-level groups are AND-ed, and AND-ed with `tags`.
+     */
+    tag_groups?: string | null;
+  };
+  url: "/v1/default/banks/{bank_id}/pages/search";
+};
+
+export type SearchPagesErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type SearchPagesError = SearchPagesErrors[keyof SearchPagesErrors];
+
+export type SearchPagesResponses = {
+  /**
+   * Successful Response
+   */
+  200: PageSearchResponse;
+};
+
+export type SearchPagesResponse = SearchPagesResponses[keyof SearchPagesResponses];
 
 export type GetKnowledgePageData = {
   body?: never;
@@ -8996,10 +9375,50 @@ export type GetKnowledgePageResponses = {
   /**
    * Successful Response
    */
-  200: KnowledgePageResponse;
+  200: PageResponse;
 };
 
 export type GetKnowledgePageResponse = GetKnowledgePageResponses[keyof GetKnowledgePageResponses];
+
+export type GetPageData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Page Id
+     */
+    page_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/pages/{page_id}";
+};
+
+export type GetPageErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetPageError = GetPageErrors[keyof GetPageErrors];
+
+export type GetPageResponses = {
+  /**
+   * Successful Response
+   */
+  200: PageResponse;
+};
+
+export type GetPageResponse = GetPageResponses[keyof GetPageResponses];
 
 export type DeleteKnowledgeNodeData = {
   body?: never;
@@ -9074,11 +9493,89 @@ export type UpdateKnowledgeNodeResponses = {
   /**
    * Successful Response
    */
-  200: KnowledgeNode;
+  200: PageNode;
 };
 
 export type UpdateKnowledgeNodeResponse =
   UpdateKnowledgeNodeResponses[keyof UpdateKnowledgeNodeResponses];
+
+export type DeletePageNodeData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Node Id
+     */
+    node_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/pages/nodes/{node_id}";
+};
+
+export type DeletePageNodeErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type DeletePageNodeError = DeletePageNodeErrors[keyof DeletePageNodeErrors];
+
+export type DeletePageNodeResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
+export type UpdatePageNodeData = {
+  body: UpdateNodeRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Node Id
+     */
+    node_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/pages/nodes/{node_id}";
+};
+
+export type UpdatePageNodeErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type UpdatePageNodeError = UpdatePageNodeErrors[keyof UpdatePageNodeErrors];
+
+export type UpdatePageNodeResponses = {
+  /**
+   * Successful Response
+   */
+  200: PageNode;
+};
+
+export type UpdatePageNodeResponse = UpdatePageNodeResponses[keyof UpdatePageNodeResponses];
 
 export type ListDirectivesData = {
   body?: never;
@@ -10566,7 +11063,7 @@ export type ExportDocumentsData = {
     /**
      * Include Knowledge Base
      *
-     * Also export Mental Models and Knowledge Pages (restored on import; whole-bank only)
+     * Also export Mental Models and Pages (restored on import; whole-bank only)
      */
     include_knowledge_base?: boolean;
   };
@@ -10755,7 +11252,7 @@ export type CloneBankData = {
     /**
      * Include Data
      *
-     * Copy the memories, what backs them, and the mental models and knowledge pages synthesized from them
+     * Copy the memories, what backs them, and the mental models and pages synthesized from them
      */
     include_data?: boolean;
     /**
@@ -11917,9 +12414,15 @@ export type LlmRequestStatsData = {
     /**
      * Period
      *
-     * Time period: 1d, 7d, or 30d
+     * Time period: 1d (by hour), 7d, or 30d (by day)
      */
     period?: string;
+    /**
+     * Split By
+     *
+     * Also split each bucket by model or by operation (returned in `series`)
+     */
+    split_by?: "model" | "operation" | null;
   };
   url: "/v1/default/banks/{bank_id}/llm-requests/stats";
 };

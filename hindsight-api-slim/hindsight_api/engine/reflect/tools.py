@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 
 from ..prompt_utils import truncate_context_for_prompt
-from ..response_models import MemoryFact
+from ..response_models import KnowledgeDocumentHit, MemoryFact
+from ..schema import fq_table
 from ..search.tags import TagGroup, TagsMatch, tag_filter_active, tags_satisfy_groups
 from ..source_scope import ids_passing, visible_document_ids
 from .tokenization import count_prompt_tokens
@@ -24,15 +25,25 @@ if TYPE_CHECKING:
     # The engine's own connection abstraction, which is what every caller passes. This said
     # `asyncpg.Connection` -- the concrete driver type -- which predates that abstraction and
     # was never what arrived here; only `.fetch()` is used, and both provide it.
-    from ...api.http import RequestContext
+    from ...models import RequestContext
     from ..db.base import DatabaseConnection
     from ..memory_engine import MemoryEngine
 
 logger = logging.getLogger(__name__)
 
-#: Snippet length for a mental-model search hit, matching the knowledge-page search
-#: API's own ``LEFT(content, 280)`` so both surfaces show a page the same way.
-_SNIPPET_CHARS = 280
+#: Default token budget for the pages ``search_mental_models`` returns whole. Pages are
+#: packed in rank order until it is spent; a page that does not fit comes back as a
+#: snippet. One page whole under a fixed 4,000-token limit (#4716) left a bank whose
+#: pages are all larger with no page at all, and the answer is not always in the top
+#: hit (#5787). A bank or a request can change it through
+#: ``reflect_default_options.reflect_search_mental_models_max_tokens``.
+DEFAULT_MENTAL_MODELS_SEARCH_MAX_TOKENS = 16000
+
+#: The budget a mental-model refresh searches pages with: the best page whole, the rest
+#: snippets. At the reflect default, test_refresh_pages_benchmark_cost's refreshes (sibling pages
+#: included) cost ~50% more input (79k -> 120k full, 69k -> 100k delta), mostly sibling
+#: pages a refresh does not need.
+REFRESH_MENTAL_MODELS_SEARCH_MAX_TOKENS = 1
 
 
 #: Retrieval plumbing that the reflect agent never reads, dropped from tool
@@ -123,7 +134,7 @@ async def tool_search_mental_models(
     query: str,
     query_embedding: list[float],
     max_results: int = 5,
-    top_result_max_tokens: int = 4000,
+    full_pages_max_tokens: int = DEFAULT_MENTAL_MODELS_SEARCH_MAX_TOKENS,
     tags: list[str] | None = None,
     tags_match: TagsMatch = "any",
     tag_groups: "list | None" = None,
@@ -142,8 +153,9 @@ async def tool_search_mental_models(
         query: Search query (for logging/tracing)
         query_embedding: Pre-computed embedding for semantic search
         max_results: Maximum number of mental models to return
-        top_result_max_tokens: Size limit for returning the best-ranked page in full; above it
-            every result is a snippet and the model reads what it wants with read_mental_models
+        full_pages_max_tokens: Budget for the pages returned whole, packed in rank order; a page
+            that does not fit is a snippet the model can read with read_mental_models. The
+            best-ranked page is always whole, as in read_mental_models
         tags: Optional tags to filter mental models
         tags_match: How to match tags - "any", "all", "any_strict", "all_strict", or "exact"
         exclude_ids: Optional list of mental model IDs to exclude (e.g., when refreshing a mental model)
@@ -153,7 +165,7 @@ async def tool_search_mental_models(
     Returns:
         Dict with matching mental models including content and freshness info
     """
-    from ..memory_engine import _knowledge_snippet, _mental_model_stale_scope_from_row, fq_table
+    from ..memory_engine import _mental_model_stale_scope_from_row, _page_snippet
     from ..search.tags import build_tag_groups_where_clause, build_tags_where_clause
 
     # Build filters dynamically
@@ -195,7 +207,7 @@ async def tool_search_mental_models(
 
     store = get_memories()
     if store.store_owned_for(bank_id):
-        matches = await store.search_knowledge_pages_semantic(
+        matches = await store.search_pages_semantic(
             bank_id,
             embedding=list(query_embedding),
             limit=max_results,
@@ -253,6 +265,7 @@ async def tool_search_mental_models(
     )
 
     mental_models = []
+    full_pages_spent = 0
 
     for row in rows:
         last_refreshed_at = row["last_refreshed_at"]
@@ -263,28 +276,32 @@ async def tool_search_mental_models(
         staleness_reason = "new in-scope memories ingested since last refresh" if is_stale else None
 
         content = row["content"] or ""
-        # The top-ranked page comes back whole, the rest as snippets. A model that
-        # answers from a snippet without reading the page is a measured failure
-        # (test_06), and the best hit is the one it is most likely to need; the
-        # cost is one page instead of five.
-        top_hit = not mental_models and count_prompt_tokens(content) <= top_result_max_tokens
+        # Whole pages in rank order, up to the budget, the rest as snippets. A model that
+        # answers from a snippet without reading the page is a measured failure (test_reflect_from_page),
+        # so the best hit is always whole, even alone over the budget: a snippet of it
+        # would leave the search with no page at all (#5787). A lower page that does not
+        # fit is skipped, not the end of packing, so a smaller one after it still can.
+        cost = count_prompt_tokens(content)
+        whole = not mental_models or full_pages_spent + cost <= full_pages_max_tokens
+        if whole:
+            full_pages_spent += cost
         mental_models.append(
             {
                 "id": str(row["id"]),
                 "name": row["name"],
-                # A snippet, like the knowledge-page search this mirrors — not the whole
-                # page. Five whole pages measured 8.7-19k tokens and were re-sent on
+                # Past the budget, a snippet like the page search this mirrors:
+                # five unbounded whole pages measured 8.7-19k tokens and were re-sent on
                 # every later turn of the loop, the largest single item in a reflect's
                 # floor (#4533). The model reads the ones it wants with
                 # ``read_mental_models``.
                 **(
                     {"content": content}
-                    if top_hit
-                    # ``_knowledge_snippet`` so a page with no body reads as
+                    if whole
+                    # ``_page_snippet`` so a page with no body reads as
                     # empty-on-purpose rather than as a blank match — the same
-                    # wording the knowledge-page search gives for the same state.
+                    # wording the page search gives for the same state.
                     else {
-                        "snippet": _knowledge_snippet(content)[:_SNIPPET_CHARS].strip(),
+                        "snippet": _page_snippet(content),
                         "content_chars": len(content),
                     }
                 ),
@@ -326,8 +343,6 @@ async def tool_read_mental_models(
     ``tag_scope`` is the caller's forced tag scope: a page outside it reads as missing,
     even when the model asks for it by id.
     """
-    from ..memory_engine import fq_table
-
     if not mental_model_ids:
         return {"error": "read_mental_models requires mental_model_ids"}
 
@@ -482,6 +497,7 @@ async def tool_recall(
     include_chunks: bool = True,
     created_after: datetime | None = None,
     created_before: datetime | None = None,
+    include_documents: bool = False,
 ) -> dict[str, Any]:
     """
     Search memories using TEMPR retrieval.
@@ -527,17 +543,60 @@ async def tool_recall(
         _quiet=True,  # Suppress logging for internal operations
         include_chunks=include_chunks,
         max_chunk_tokens=max_chunk_tokens,
+        include_documents=include_documents,
     )
 
+    # A chunk is raw source text: "I signed up yesterday" means nothing without the date it was
+    # said on. Its facts carry that date, so the chunk borrows it from the first one.
+    chunk_dates = {m.chunk_id: m.mentioned_at for m in reversed(result.results) if m.chunk_id and m.mentioned_at}
+    documents = _knowledge_documents(result.documents)
     return {
+        **documents,
         "query": query,
         "memories": [_drop_unread_fields(_prune_nulls(m.model_dump())) for m in result.results],
         # ``chunks`` is deliberately not trimmed: ChunkInfo carries only
         # chunk_text / chunk_index / truncated, so it holds none of the fields
         # above and the call would be a no-op. Pinned by
         # test_chunk_info_carries_no_unread_fields.
-        "chunks": {k: _prune_nulls(v.model_dump()) for k, v in (result.chunks or {}).items()},
+        "chunks": {
+            k: _prune_nulls({**v.model_dump(), "mentioned_at": chunk_dates.get(k)})
+            for k, v in (result.chunks or {}).items()
+        },
     }
+
+
+_DOCUMENTS_NOTE = (
+    "These documents come from the knowledge banks linked to this memory bank: authoritative product "
+    "documentation. When a document and a memory disagree, the document is right; answer from the document "
+    "and say the memory is outdated."
+)
+
+
+def _knowledge_documents(hits: list[KnowledgeDocumentHit] | None) -> dict[str, Any]:
+    """The linked knowledge banks' passages, for the agent: what it can read of them, plus who wins."""
+    if not hits:
+        return {}
+    docs = [
+        _prune_nulls(
+            {
+                "source": h.filename or h.document_id,
+                "document_id": h.document_id,
+                "page": h.page,
+                "start_ms": h.start_ms,
+                "end_ms": h.end_ms,
+                "media_type": h.media_type,
+                # A page image or a clip has no text the agent can read; it still learns the doc matched.
+                "text": h.text or f"[{h.media_type} passage: no text]",
+            }
+        )
+        for h in hits
+    ]
+    return {"documents_note": _DOCUMENTS_NOTE, "documents": docs}
+
+
+def _iso(value: datetime | None) -> str | None:
+    """A stored date as recall's results carry it."""
+    return value.isoformat() if value else None
 
 
 def returned_memories(tool: str, output: dict[str, Any]) -> list[MemoryFact]:
@@ -600,8 +659,6 @@ async def tool_expand(
     Returns:
         Dict with results array, each containing memory, chunk, and optionally document data
     """
-    from ..memory_engine import fq_table
-
     if not memory_ids:
         return {"error": "memory_ids is required and must not be empty"}
 
@@ -696,14 +753,22 @@ async def tool_expand(
             results.append({"memory_id": mid, "error": f"Memory not found: {mid}"})
             continue
 
+        # Recall shows a memory's dates, so expand must too: without them "yesterday" in the
+        # memory, or in its chunk, cannot be placed in time.
+        mentioned_at = _iso(memory["mentioned_at"])
         item: dict[str, Any] = {
             "memory_id": mid,
-            "memory": {
-                "id": str(memory["id"]),
-                "text": memory["text"],
-                "type": memory["fact_type"],
-                "context": truncate_context_for_prompt(memory["context"]),
-            },
+            "memory": _prune_nulls(
+                {
+                    "id": str(memory["id"]),
+                    "text": memory["text"],
+                    "type": memory["fact_type"],
+                    "context": truncate_context_for_prompt(memory["context"]),
+                    "occurred_start": _iso(memory["occurred_start"]),
+                    "occurred_end": _iso(memory["occurred_end"]),
+                    "mentioned_at": mentioned_at,
+                }
+            ),
         }
 
         if memory["id"] in withheld_ids:
@@ -714,12 +779,16 @@ async def tool_expand(
         # Add chunk if available
         if memory["chunk_id"] and memory["chunk_id"] in chunk_map:
             chunk = chunk_map[cast(str, memory["chunk_id"])]
-            item["chunk"] = {
-                "id": chunk["chunk_id"],
-                "text": chunk["chunk_text"],
-                "index": chunk["chunk_index"],
-                "document_id": chunk["document_id"],
-            }
+            item["chunk"] = _prune_nulls(
+                {
+                    "id": chunk["chunk_id"],
+                    "text": chunk["chunk_text"],
+                    "index": chunk["chunk_index"],
+                    "document_id": chunk["document_id"],
+                    # The chunk was said when its memory was mentioned (see tool_recall).
+                    "mentioned_at": mentioned_at,
+                }
+            )
             # Add document if depth=document
             if depth == "document" and chunk["document_id"] in doc_map:
                 doc = doc_map[chunk["document_id"]]

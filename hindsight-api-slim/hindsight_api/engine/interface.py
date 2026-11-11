@@ -11,8 +11,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from hindsight_api.engine.memory_engine import BankLlmHealthInfo, Budget
-    from hindsight_api.engine.response_models import RecallResult, ReflectResult
+    from hindsight_api.engine.memory_engine import BankLlmHealthInfo
+    from hindsight_api.engine.response_models import Budget, RecallResult, ReflectResult
     from hindsight_api.engine.search.tags import TagGroup, TagsMatch
     from hindsight_api.extensions import BankWriteOperation
     from hindsight_api.models import RequestContext
@@ -264,27 +264,6 @@ class MemoryEngineInterface(ABC):
             bank_id: The memory bank ID.
             disposition: Dict with trait values.
             request_context: Request context for authentication.
-        """
-        ...
-
-    @abstractmethod
-    async def merge_bank_mission(
-        self,
-        bank_id: str,
-        new_info: str,
-        *,
-        request_context: "RequestContext",
-    ) -> dict[str, Any]:
-        """
-        Merge new mission information into bank profile.
-
-        Args:
-            bank_id: The memory bank ID.
-            new_info: New mission information to merge.
-            request_context: Request context for authentication.
-
-        Returns:
-            Updated mission info.
         """
         ...
 

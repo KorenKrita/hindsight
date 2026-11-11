@@ -448,6 +448,33 @@ class TestDeltaRefreshPlumbing:
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
+    async def test_refresh_reads_only_the_best_page_whole(
+        self,
+        memory: MemoryEngine,
+        request_context: RequestContext,
+        patch_reflect,
+    ):
+        """A refresh keeps the lean page budget; reflect's default raised its cost ~50% (#5787)."""
+        from hindsight_api.engine.reflect.tools import REFRESH_MENTAL_MODELS_SEARCH_MAX_TOKENS
+
+        bank_id = f"test-page-budget-{uuid.uuid4().hex[:8]}"
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
+        mm = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="API Reference",
+            source_query="Document the API",
+            content="## Old\n\nOriginal.\n",
+            trigger={"mode": "full"},
+            request_context=request_context,
+        )
+        calls = patch_reflect(memory, text="# Team\n\nSomething.\n")
+
+        await memory.refresh_mental_model(bank_id=bank_id, mental_model_id=mm["id"], request_context=request_context)
+
+        assert calls[0]["reflect_search_mental_models_max_tokens_override"] == REFRESH_MENTAL_MODELS_SEARCH_MAX_TOKENS
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
     async def test_plain_text_answer_still_produces_a_document(
         self,
         memory: MemoryEngine,
@@ -1906,22 +1933,24 @@ pytestmark_gemini = pytest.mark.skipif(
 async def gemini_memory(memory_no_llm_verify: MemoryEngine):
     """MemoryEngine wired to a real LLM for reflect + structured delta.
 
-    Prefers Gemini (the original target) but falls back to OpenAI when the
-    Gemini key is unavailable — the structured-delta architecture works
-    against either, and waiting on a single provider's key would block
-    iteration. The chosen model is logged so test failures are unambiguous
-    about which provider produced them.
+    Provider and model come from the environment (the job's main LLM), so the eval
+    measures the model the job is testing. It used to pin Gemini whenever a Gemini key
+    was set (falling back to OpenAI), which meant a job testing another model never ran
+    these evals against it.
     """
-    if _GEMINI_API_KEY:
-        provider = "gemini"
-        # gemini-2.0-flash was retired by the provider (404 NOT_FOUND); this is the
-        # model the repo's own .env and the other Gemini tests use.
-        model = os.getenv("HINDSIGHT_GEMINI_EVAL_MODEL", "gemini-3.1-flash-lite")
-        cfg = LLMConfig(provider=provider, api_key=_GEMINI_API_KEY, base_url="", model=model)
-    else:
-        provider = "openai"
-        model = os.getenv("HINDSIGHT_OPENAI_EVAL_MODEL", "gpt-4o-mini")
-        cfg = LLMConfig(provider=provider, api_key=_OPENAI_API_KEY or "", base_url="", model=model)
+    from hindsight_api.config import get_config
+
+    config = get_config()
+    provider, model = config.llm_provider, config.llm_model
+    cfg = LLMConfig(
+        provider=provider,
+        api_key=config.llm_api_key or _GEMINI_API_KEY or _OPENAI_API_KEY or "",
+        base_url=config.llm_base_url or "",
+        model=model,
+        vertexai_project_id=config.llm_vertexai_project_id,
+        vertexai_region=config.llm_vertexai_region,
+        vertexai_service_account_key=config.llm_vertexai_service_account_key,
+    )
     print(f"\n[delta-eval] using provider={provider} model={model}")
     memory_no_llm_verify._reflect_llm_config = cfg
     memory_no_llm_verify._llm_config = cfg

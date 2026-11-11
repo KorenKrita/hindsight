@@ -8,8 +8,8 @@
  *   - seedIfCold(repoPath)          : plugin load -> cold-check auto-seed (the page preamble is
  *                                     NOT computed here; onPrompt builds it per session)
  *   - onPrompt(sessionId, prompt)   : each user turn -> recall + build this turn's injection
- *   - getInjection(sessionId)       : the system-prompt text to inject this turn (or undefined)
- *   - toolSpecs()                   : the hindsight_* knowledge/recall tools to register natively
+ *   - getInjection(sessionId)       : the text to inject into this turn's user message (or undefined)
+ *   - toolSpecs()                   : the hindsight_* page/recall tools to register natively
  *   - onTranscript(sessionId, turns, lastTurnComplete): full transcript -> write back (on by default)
  *   - onSessionIdle(sessionId)      : assistant finished -> refetch + write back the completed
  *                                     exchange (the Stop-equivalent these hosts lack)
@@ -22,8 +22,8 @@ import { DAEMON_WAIT_RETAIN_MS, DAEMON_WAIT_SESSION_START_MS, ensureDaemon } fro
 import { diag } from "./diag";
 import { describeError, log, setLogLevel } from "./log";
 import type { HindsightClient } from "./hindsight";
-import { buildKnowledgePreamble } from "./knowledge-injection";
-import { buildKnowledgeTools, type ToolSpec } from "./knowledge-tools";
+import { buildPagesPreamble } from "./page-injection";
+import { buildPageTools, type ToolSpec } from "./page-tools";
 import { buildPageTrigger } from "./missions";
 import { retainLiveSession, type TransportTurn } from "./chat";
 import { memoryCursorStore } from "./retain-cursor";
@@ -32,6 +32,7 @@ import { buildRetainStamp } from "./retain-stamp";
 import { buildSessionStartContext } from "./session-start";
 import { syncCompanionSkill } from "./skill-sync";
 import { buildHookOutput } from "./hook";
+import { stripInjectedMemory } from "./transcript-util";
 import { sessionCacheFile, writeSessionCache } from "./session-cache";
 
 const HARNESS = "opencode";
@@ -50,7 +51,6 @@ export class RuntimeCore {
   private fetchTranscript?: (sessionId: string) => Promise<TransportTurn[]>;
   /** Write-backs started and not yet settled — what `flush` waits for. */
   private readonly inFlight = new Set<Promise<void>>();
-  private lastInjection = ""; // most recent turn's injection block, keyed by nothing (see getInjection)
   private deferInitialReflect = false;
   /** Host-notice channel (opencode/Kilo: client.tui.showToast via the adapter). Optional, fail-open. */
   private notify?: (title: string, message: string) => void;
@@ -85,9 +85,9 @@ export class RuntimeCore {
     this.fetchTranscript = fetch;
   }
 
-  /** The hindsight_* knowledge + recall tools, bound to this bank, for the harness to register natively. */
+  /** The hindsight_* page + recall tools, bound to this bank, for the harness to register natively. */
   toolSpecs(): ToolSpec[] {
-    return buildKnowledgeTools(this.client, this.bankId, {
+    return buildPageTools(this.client, this.bankId, {
       repoDir: this.projectDir,
       harness: this.harness,
       pageTrigger: buildPageTrigger(this.cfg),
@@ -112,7 +112,7 @@ export class RuntimeCore {
    * git-log seed + codebase survey. Reuses the exact hook-harness logic
    * (`buildSessionStartContext`) so opencode seeds identically. Never throws.
    *
-   * It deliberately does NOT keep that call's knowledge preamble. This runs once per PROCESS and
+   * It deliberately does NOT keep that call's pages preamble. This runs once per PROCESS and
    * these hosts outlive every session, so a roster captured here is stale for every session but
    * the first — `onPrompt` builds its own from the session's live page list (#4607).
    */
@@ -165,9 +165,18 @@ export class RuntimeCore {
    * intentionally replaces the old in-memory reflect/page state, keeping lifecycle behavior
    * identical across hosts while this adapter retains only delivery-specific state.
    */
-  async onPrompt(sessionId: string | undefined, prompt: string): Promise<void> {
+  async onPrompt(sessionId: string | undefined, rawPrompt: string): Promise<void> {
     if (process.env.HINDSIGHT_DISABLE_HOOKS) return; // anti-recursion (see seedIfCold)
-    if (!sessionId || !prompt.trim()) return;
+    if (!sessionId) return;
+    // Same cleaning as the hook harnesses' runHook: a host's tagged block ahead of the user's
+    // words would otherwise become the reflect goal and the length-capped recall query (#6488).
+    const prompt = stripInjectedMemory(rawPrompt).trim();
+    // No prompt text means no recall, so no block for this turn either: the previous turn's block
+    // must not be handed out again, since every host now persists it into the user message.
+    if (!prompt) {
+      this.injection.delete(sessionId);
+      return;
+    }
     const turns = (this.turnCount.get(sessionId) ?? 0) + 1;
     this.turnCount.set(sessionId, turns);
 
@@ -193,11 +202,11 @@ export class RuntimeCore {
     // The SessionStart-equivalent preamble, injected once on the first turn (later turns get the
     // periodic refresh from buildHookOutput). Built HERE, from this session's own roster, rather
     // than reused from plugin load: that one is a process-lifetime snapshot, so a host started before the pages
-    // existed told every later session "No knowledge pages yet" while the same turn's memory block
+    // existed told every later session "No pages yet" while the same turn's memory block
     // listed pages by id (#4607).
     if (turns === 1) {
       blocks.push(
-        buildKnowledgePreamble(output.pages, {
+        buildPagesPreamble(output.pages, {
           reflectOnNewGoals: this.cfg.autoInject !== "reflect",
           extra: this.cfg.toolGuideExtra,
         })
@@ -207,25 +216,33 @@ export class RuntimeCore {
     // OpenCode has no user-message hook channel; use its native toast instead of stderr, which
     // renders inside the TUI input line. The shared output owns when a notice exists.
     if (output.notice) {
-      const preview = output.notice.replace(/\s+/g, " ").trim().slice(0, 140);
+      // The notice is painted for a terminal; a toast shows the escapes as text (#6257).
+      const preview = output.notice
+        .replace(/\x1b\[[0-9;]*m/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 140);
       log.info(this.harness, "reflect goal", { preview });
       this.notify?.("Hindsight · recalled past decisions", preview);
     }
     const block = blocks.filter(Boolean).join("\n\n");
     this.injection.set(sessionId, block);
-    this.lastInjection = block; // for consumers that can't supply a sessionId (see getInjection)
   }
 
   /**
-   * The system-prompt text to inject this turn (built by the preceding onPrompt), or undefined.
-   * opencode's `experimental.chat.system.transform` hook fires with NO sessionId (input is just
-   * `{model}`), so a session-keyed lookup returns nothing there — fall back to the most recent
-   * turn's block (`lastInjection`). The completion's system.transform fires right after that
-   * session's `chat.message`/onPrompt, so `lastInjection` is this turn's block.
+   * The text to inject into this turn's user message (built by the preceding onPrompt), or
+   * undefined.
+   *
+   * It goes into the USER turn on every host, never the system prompt (#5914). The block changes
+   * from turn to turn — the recall runs once, the roster refresh on a cadence — so a system prompt
+   * carrying it differed between requests and broke the provider's prefix cache from that point
+   * on. Persisted in the turn it belongs to, it leaves the system prompt and the earlier history
+   * byte-identical. That used to need a fallback to the most recent block for opencode's
+   * `experimental.chat.system.transform`, which fired with no session id; nothing reads it that
+   * way any more.
    */
-  getInjection(sessionId: string | undefined): string | undefined {
-    const keyed = sessionId ? this.injection.get(sessionId) : undefined;
-    return keyed ?? this.lastInjection ?? undefined;
+  getInjection(sessionId: string): string | undefined {
+    return this.injection.get(sessionId) || undefined;
   }
 
   /**

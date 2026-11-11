@@ -14,7 +14,7 @@ from json_repair import repair_json
 from pydantic import BaseModel
 
 from .._cross_loop import CrossLoopSemaphore
-from .response_models import LLMCallResult
+from .response_models import LLMCallResult, TokenUsage
 
 # Vertex AI credentials (for LLMProvider to pass to GeminiLLM). Only checked for
 # here; google-auth is imported where a key is actually loaded, not on every start.
@@ -30,16 +30,19 @@ from ..config import (
     ENV_RETAIN_LLM_MAX_CONCURRENT,
     _get_raw_config,
 )
+from ..provider_auth import is_custom_llm_provider
 
 # Re-exported: this module is where callers have always imported it from.
 from ..provider_auth import requires_api_key as requires_api_key
 from .cache_affinity import parse_cache_affinity
 from .llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
+    LLM_TOOL_CHOICE_REQUIRED,
     LLMInterface,
     LLMToolChoice,
     LLMToolChoiceMode,
     PromptCachePrefix,
+    ProviderUnavailableError,
 )
 from .llm_interface import (
     OutputTooLongError as OutputTooLongError,
@@ -167,14 +170,17 @@ async def _acquire_permits(stack: AsyncExitStack, scope: str) -> None:
     """
     from ..worker.background import in_background_task
     from .llm_trace import record_queue_wait
+    from .permit_wait import waiting_for_permit
 
     # Calls from a background worker task yield the next free permit to any waiting
     # live request.
     background = in_background_task()
     queue_start = time.monotonic()
-    for sem in _semaphores_for_scope(scope):
-        await sem.acquire(background=background)
-        stack.callback(sem.release)
+    # Queued time is not this operation's work; time limits that opted in exclude it (#6140).
+    with waiting_for_permit():
+        for sem in _semaphores_for_scope(scope):
+            await sem.acquire(background=background)
+            stack.callback(sem.release)
     record_queue_wait(time.monotonic() - queue_start)
 
 
@@ -450,6 +456,29 @@ def parse_llm_json(raw: str) -> Any:
         return sanitize_value(repaired)
 
 
+def reask_messages(messages: list[dict[str, Any]], reply: Any, correction: str) -> list[dict[str, Any]]:
+    """The request again, plus the refused reply and what was wrong with it: one re-ask.
+
+    Every structured call that re-asks after a bad reply (retain, consolidation, the
+    mental-model delta) goes through here. At a fixed low temperature an identical prompt
+    returns the identical bad reply (#3421), so the re-ask must change the input: it quotes
+    the reply and the errors. It appends and never rewrites, so the original request stays a
+    byte-identical prefix and the provider's prompt cache still covers it.
+
+    The reply goes back as text. A provider parses the body when the call set a
+    ``response_format`` (a dict under ``skip_validation``, a model otherwise), and a strict
+    request validator refuses anything but a string as ``content`` with a 422 (#4965).
+    Serialized, not stringified, so the model reads back the JSON it wrote.
+    """
+    if isinstance(reply, BaseModel):
+        text = reply.model_dump_json()
+    elif isinstance(reply, dict | list):
+        text = json.dumps(reply, ensure_ascii=False, default=str)
+    else:
+        text = "" if reply is None else str(reply)
+    return [*messages, {"role": "assistant", "content": text}, {"role": "user", "content": correction}]
+
+
 def _validate_ollama_num_ctx(value: Any) -> int | None:
     """Validate a native Ollama context-window override."""
     if value is None:
@@ -459,6 +488,43 @@ def _validate_ollama_num_ctx(value: Any) -> int | None:
     if value < 1:
         raise ValueError(f"ollama_num_ctx must be >= 1, got {value}")
     return value
+
+
+def _create_custom_llm_provider(
+    *,
+    provider: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    reasoning_effort: str | None,
+    timeout: float | None,
+    extra_body: dict[str, Any] | None,
+    default_headers: dict[str, str] | None,
+) -> LLMInterface:
+    """Build the operator's own provider named by ``provider`` (``package.module:ClassName``).
+
+    The class must subclass ``LLMInterface``. It is constructed with keyword arguments
+    only: the ``LLMInterface.__init__`` ones plus ``extra_body`` and ``default_headers``,
+    so a subclass of ``OpenAICompatibleLLM`` takes them as-is and a direct
+    ``LLMInterface`` subclass receives the last two in ``**kwargs``.
+    """
+    # Lazy: the extensions package imports the engine.
+    from ..extensions.loader import ExtensionLoadError, resolve_class_path
+
+    try:
+        provider_class = resolve_class_path(provider, LLMInterface)
+    except ExtensionLoadError as e:
+        raise ValueError(f"Cannot load custom LLM provider {provider!r}: {e}") from e
+    return provider_class(
+        provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        timeout=timeout,
+        extra_body=extra_body,
+        default_headers=default_headers,
+    )
 
 
 def create_llm_provider(
@@ -482,7 +548,7 @@ def create_llm_provider(
     timeout: float | None = None,
     ollama_num_ctx: int | None = None,
     cache_affinity: str | None = None,
-    structured_output_forced_tool: bool = False,
+    structured_output_in_prompt: bool = False,
     # Appended rather than inserted: some callers still pass the older settings
     # positionally (guarded by the positional-compatibility tests in
     # tests/test_llm_wrapper.py), so a parameter added mid-list silently steals
@@ -522,10 +588,10 @@ def create_llm_provider(
             OpenAI-compatible wire format): "none" (default), "xai_conv_id",
             "openai_prompt_cache_key", or "auto". Providers on other branches do their own
             cache work or none at all. See ``engine/cache_affinity.py``.
-        structured_output_forced_tool: Ask the LiteLLM-backed providers (``litellm``,
-            ``litellmrouter``, ``bedrock``) for structured output via a forced tool call
+        structured_output_in_prompt: Give the LiteLLM-backed providers (``litellm``,
+            ``litellmrouter``, ``bedrock``) the structured-output schema in the prompt
             instead of ``response_format``. For backends that reject the response_format
-            route — see ``HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_FORCED_TOOL``. Other
+            route — see ``HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_IN_PROMPT``. Other
             providers ignore it.
         vertexai_project_id: Vertex AI project ID (for VertexAI provider).
         vertexai_region: Vertex AI region (for VertexAI provider).
@@ -546,6 +612,18 @@ def create_llm_provider(
 
     # Each provider (and its SDK) loads only when chosen; see providers/__init__.py.
     from . import providers
+
+    if is_custom_llm_provider(provider):
+        return _create_custom_llm_provider(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+            extra_body=extra_body,
+            default_headers=default_headers,
+        )
 
     provider_lower = provider.lower()
     if provider_lower == "gemini":
@@ -653,7 +731,7 @@ def create_llm_provider(
             extra_body=extra_body,
             default_headers=default_headers,
             timeout=timeout,
-            structured_output_forced_tool=structured_output_forced_tool,
+            structured_output_in_prompt=structured_output_in_prompt,
         )
 
     elif provider_lower == "litellmrouter":
@@ -674,7 +752,7 @@ def create_llm_provider(
             extra_body=extra_body,
             default_headers=default_headers,
             timeout=timeout,
-            structured_output_forced_tool=structured_output_forced_tool,
+            structured_output_in_prompt=structured_output_in_prompt,
         )
 
     elif provider_lower == "bedrock":
@@ -690,7 +768,7 @@ def create_llm_provider(
             default_headers=default_headers,
             bedrock_service_tier=bedrock_service_tier,
             timeout=timeout,
-            structured_output_forced_tool=structured_output_forced_tool,
+            structured_output_in_prompt=structured_output_in_prompt,
         )
 
     elif provider_lower == "llamacpp":
@@ -864,7 +942,7 @@ class LLMProvider:
         max_backoff: float | None = None,
         ollama_num_ctx: int | None = None,
         cache_affinity: str | None = None,
-        structured_output_forced_tool: bool = False,
+        structured_output_in_prompt: bool = False,
         # Appended rather than inserted — see the note on ``create_llm_provider``:
         # callers that pass these positionally would otherwise have one argument
         # land in the wrong slot.
@@ -916,9 +994,9 @@ class LLMProvider:
                 ``max_retries``. ``None`` keeps each method's own fallback.
             max_backoff: Default maximum retry backoff (seconds), same resolution as
                 ``max_retries``. ``None`` keeps each method's own fallback.
-            structured_output_forced_tool: Structured output via a forced tool call
+            structured_output_in_prompt: The structured-output schema in the prompt
                 instead of ``response_format``, for the LiteLLM-backed providers - from
-                config (``HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_FORCED_TOOL``).
+                config (``HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_IN_PROMPT``).
             codex_home: Codex credentials directory for ``provider="openai-codex"`` — the
                 directory holding the ``auth.json`` this provider authenticates with. ``None``
                 uses the process-wide ``CODEX_HOME`` (else ``~/.codex``). Set it per member of a
@@ -932,7 +1010,8 @@ class LLMProvider:
         pure function of its arguments — which is what lets each member of a multi-LLM chain be
         configured independently.
         """
-        self.provider = provider.lower()
+        # A custom provider is a class path, and class names are case-sensitive.
+        self.provider = provider if is_custom_llm_provider(provider) else provider.lower()
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
@@ -957,7 +1036,7 @@ class LLMProvider:
         self.gemini_service_tier = gemini_service_tier
         # Structured-output transport for the LiteLLM-backed providers. Used verbatim —
         # the caller resolves the server-level default, like the fields above.
-        self.structured_output_forced_tool = structured_output_forced_tool
+        self.structured_output_in_prompt = structured_output_in_prompt
         self.ollama_num_ctx = _validate_ollama_num_ctx(ollama_num_ctx)
         # Gemini safety settings (instance default; can be overridden per-request via context var)
         self.gemini_safety_settings = gemini_safety_settings
@@ -1013,8 +1092,11 @@ class LLMProvider:
             "xai-oauth",
             "meta",
         ]
-        if self.provider not in valid_providers:
-            raise ValueError(f"Invalid LLM provider: {self.provider}. Must be one of: {', '.join(valid_providers)}")
+        if self.provider not in valid_providers and not is_custom_llm_provider(self.provider):
+            raise ValueError(
+                f"Invalid LLM provider: {self.provider}. Must be one of: {', '.join(valid_providers)}, "
+                "or package.module:ClassName for a custom provider."
+            )
 
         # Set default base URLs
         if not self.base_url:
@@ -1100,30 +1182,51 @@ class LLMProvider:
         router_config: dict[str, Any] | None = self.litellmrouter_config
 
         # Create provider implementation using factory
-        self._provider_impl = create_llm_provider(
-            provider=self.provider,
-            api_key=self.api_key,
-            base_url=self.base_url,
-            model=self.model,
-            reasoning_effort=self.reasoning_effort,
-            groq_service_tier=self.groq_service_tier,
-            openai_service_tier=self.openai_service_tier,
-            bedrock_service_tier=self.bedrock_service_tier,
-            gemini_service_tier=self.gemini_service_tier,
-            codex_home=self.codex_home,
-            extra_body=self.extra_body,
-            default_headers=self.default_headers,
-            vertexai_project_id=vertexai_project_id,
-            vertexai_region=vertexai_region,
-            vertexai_credentials=vertexai_credentials,
-            gemini_safety_settings=self.gemini_safety_settings,
-            prompt_cache_enabled=self.prompt_cache_enabled,
-            litellmrouter_config=router_config,
-            ollama_num_ctx=self.ollama_num_ctx,
-            timeout=self.timeout,
-            cache_affinity=self.cache_affinity,
-            structured_output_forced_tool=self.structured_output_forced_tool,
-        )
+        try:
+            self._provider_impl = create_llm_provider(
+                provider=self.provider,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                model=self.model,
+                reasoning_effort=self.reasoning_effort,
+                groq_service_tier=self.groq_service_tier,
+                openai_service_tier=self.openai_service_tier,
+                bedrock_service_tier=self.bedrock_service_tier,
+                gemini_service_tier=self.gemini_service_tier,
+                codex_home=self.codex_home,
+                extra_body=self.extra_body,
+                default_headers=self.default_headers,
+                vertexai_project_id=vertexai_project_id,
+                vertexai_region=vertexai_region,
+                vertexai_credentials=vertexai_credentials,
+                gemini_safety_settings=self.gemini_safety_settings,
+                prompt_cache_enabled=self.prompt_cache_enabled,
+                litellmrouter_config=router_config,
+                ollama_num_ctx=self.ollama_num_ctx,
+                timeout=self.timeout,
+                cache_affinity=self.cache_affinity,
+                structured_output_in_prompt=self.structured_output_in_prompt,
+            )
+        except ProviderUnavailableError as e:
+            from .providers.none_llm import UnavailableLLM
+
+            # A missing or revoked sign-in must not stop the server: build a member
+            # that fails every call instead, so a failover chain moves on to its next
+            # member and recall keeps working (#6095). Bad configuration still raises.
+            logger.warning(
+                "LLM %s/%s is unavailable and will fail every call until it is fixed and the server restarted: %s",
+                self.provider,
+                self.model,
+                e,
+            )
+            self._provider_impl = UnavailableLLM(
+                e,
+                provider=self.provider,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                model=self.model,
+                reasoning_effort=self.reasoning_effort,
+            )
 
         # Backward compatibility: Keep mock provider properties
         self._mock_calls: list[dict] = []
@@ -1467,20 +1570,30 @@ class LLMProvider:
         max_retries: int | None = None,
         initial_backoff: float | None = None,
         max_backoff: float | None = None,
-        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
-        cached_prefix: str | None = None,
-        cached_prefix_message_count: int = 0,
+        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_REQUIRED,
+        declared_tools: list[dict[str, Any]] | None = None,
     ) -> "LLMToolCallResult":
-        """Make an LLM call with tool calling — see ``_call_with_tools`` for the arguments.
+        """One turn of a tool-using conversation: the call the model makes next.
 
-        Like ``call``, an installed LLM request extension decides first how it is sent.
+        Made through ``call`` with a response schema, for every provider — no provider is
+        sent ``tools`` or ``tool_choice`` (see ``providers/tools_via_schema.py``). ``tool_choice``
+        names the function this turn must call, or leaves the model to pick one (``auto`` and
+        ``required`` both mean "exactly one"). ``messages`` may hold earlier calls
+        (``tool_calls`` on an assistant turn) and their results (``role: tool``).
+
+        ``declared_tools`` are the functions described in the system prompt, when they are
+        not just ``tools`` (the ones this turn may call): declaring the same functions on
+        every turn of a conversation keeps its prompt prefix, and the provider's cache of
+        it, the same while a turn narrows what it may call.
         """
-        from ..extensions.llm_request import bind_llm_request
+        from .llm_trace import SchemaToolTurn, reset_schema_tool_turn, set_schema_tool_turn
+        from .providers import tools_via_schema
+        from .providers.mock_llm import MockLLM
+        from .response_models import LLMToolCallResult
 
-        bound = await bind_llm_request(self)
-        receiver = bound.llm or self
-        try:
-            return await receiver._call_with_tools(
+        if isinstance(self._provider_impl, MockLLM):
+            # The test double scripts calls directly; it sends nothing anywhere.
+            return await self._call_with_tools(
                 messages=messages,
                 tools=tools,
                 max_completion_tokens=max_completion_tokens,
@@ -1490,13 +1603,83 @@ class LLMProvider:
                 initial_backoff=initial_backoff,
                 max_backoff=max_backoff,
                 tool_choice=tool_choice,
-                # A cache handle belongs to the LLM that created it; another LLM
-                # cannot read it, so a delegated call sends its prefix uncached.
-                cached_prefix=cached_prefix if receiver is self else None,
-                cached_prefix_message_count=cached_prefix_message_count if receiver is self else 0,
             )
+        held = tools_via_schema.response_schema(tools, tool_choice)
+        text_messages = tools_via_schema.as_text_messages(
+            [*messages, {"role": "user", "content": tools_via_schema.turn_request(tools, tool_choice)}],
+            declared_tools or tools,
+        )
+        # The model-call record is built inside ``call``: bound here, it carries the turn's calls.
+        turn_token = set_schema_tool_turn(SchemaToolTurn(tools=tools, tool_choice=tool_choice))
+        usage = TokenUsage()  # a correction is billed too
+        try:
+            for correction in range(2):
+                for attempt in range(2):
+                    try:
+                        result = await self.call(
+                            messages=text_messages,
+                            response_format=tools_via_schema.schema_format(held),
+                            max_completion_tokens=max_completion_tokens,
+                            temperature=temperature,
+                            scope=scope,
+                            max_retries=max_retries,
+                            initial_backoff=initial_backoff,
+                            max_backoff=max_backoff,
+                            skip_validation=True,
+                            strict_schema=True,
+                        )
+                        break
+                    except OutputTooLongError:
+                        # A held reply that loops (whitespace, a digit run) until the cap is a sampling
+                        # accident: one more sample came back whole in every case measured on Gemma 4.
+                        if attempt:
+                            raise
+                        logger.warning(f"[{scope}] schema reply hit the token cap; sampling once more")
+                    except json.JSONDecodeError as exc:
+                        # Prose where the schema asked for JSON, after the provider's own retries: a
+                        # model that does not follow the schema. A turn with no call, as a prose reply
+                        # always was, so the caller can say the model is the problem (reflect raises
+                        # ReflectToolCallError on a first turn) rather than fail on a parse error.
+                        logger.warning(f"[{scope}] reply did not follow the response schema: {exc}")
+                        # The prose rides as content, so the error can quote what the model said.
+                        return LLMToolCallResult(content=exc.doc or None, tool_calls=[], finish_reason="stop")
+                usage = usage + result.usage
+                reply = (
+                    result.content
+                    if isinstance(result.content, str)
+                    else json.dumps(result.content, ensure_ascii=False)
+                )
+                tool_calls = tools_via_schema.calls_from_reply(reply, tools, tool_choice)
+                violation = tools_via_schema.reply_violation(reply, tool_calls, tools)
+                if violation is None:
+                    break
+                if correction:
+                    # Corrected once and still wrong: a model (or endpoint) that does not follow
+                    # the schema. A turn with no call, so the caller reports that, not a missing answer.
+                    logger.warning(f"[{scope}] reply broke the response schema after a correction: {violation}")
+                    tool_calls = []
+                    break
+                logger.warning(f"[{scope}] reply broke the response schema, asking once more: {violation}")
+                text_messages = [
+                    *text_messages,
+                    {"role": "assistant", "content": reply},
+                    {
+                        "role": "user",
+                        "content": f"That reply does not fit the required format: {violation}. "
+                        + tools_via_schema.turn_request(tools, tool_choice),
+                    },
+                ]
         finally:
-            bound.reset()
+            reset_schema_tool_turn(turn_token)
+        return LLMToolCallResult(
+            content=None if tool_calls else reply,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else "stop",
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cached_tokens=usage.cached_tokens,
+            thoughts_tokens=usage.thoughts_tokens,
+        )
 
     async def _call_with_tools(
         self,
@@ -1509,11 +1692,9 @@ class LLMProvider:
         initial_backoff: float | None = None,
         max_backoff: float | None = None,
         tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
-        cached_prefix: str | None = None,
-        cached_prefix_message_count: int = 0,
     ) -> "LLMToolCallResult":
         """
-        Make an LLM API call with tool/function calling support.
+        The mock provider's scripted tool call, with the wrapper's permits and tracing.
 
         Args:
             messages: List of message dicts. Can include tool results with role='tool'.
@@ -1584,15 +1765,6 @@ class LLMProvider:
                     # `attempt=N` stamp (see call() above, #3002).
                     set_stage(base_stage)
 
-                # cached_prefix is only set for providers that returned a handle
-                # from get_or_create_cached_prefix() / create_incremental_cache();
-                # forward it (plus how many leading messages it covers) only when
-                # present so non-caching providers keep their signature.
-                cache_kwarg = (
-                    {"cached_prefix": cached_prefix, "cached_prefix_message_count": cached_prefix_message_count}
-                    if cached_prefix is not None
-                    else {}
-                )
                 try:
                     # Delegate to provider implementation
                     attempt_kwarg = {"attempt_context": lambda: _attempt_permits(scope)} if attempt_gated else {}
@@ -1606,7 +1778,6 @@ class LLMProvider:
                         initial_backoff=initial_backoff,
                         max_backoff=max_backoff,
                         tool_choice=tool_choice,
-                        **cache_kwarg,
                         **attempt_kwarg,
                     )
                 except Exception as e:
@@ -1834,7 +2005,7 @@ class LLMProvider:
             vertexai_region=config.llm_vertexai_region,
             vertexai_service_account_key=config.llm_vertexai_service_account_key,
             timeout=config.llm_timeout,
-            structured_output_forced_tool=config.llm_structured_output_forced_tool,
+            structured_output_in_prompt=config.llm_structured_output_in_prompt,
         )
 
 

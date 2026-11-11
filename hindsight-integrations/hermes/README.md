@@ -53,6 +53,11 @@ database (`~/.pg0/instances/hindsight-embed-<profile>/`) and the profile env
 (`~/.hindsight/profiles/<profile>.env`) are the same files, read the same way. No migration step, no
 re-setup.
 
+To run the daemon on a database you already have instead of its own pg0, set
+`HINDSIGHT_API_DATABASE_URL` (or `HINDSIGHT_EMBED_API_DATABASE_URL`) in `$HERMES_HOME/.env` or in the
+profile env. The plugin writes it into the profile env, so every daemon it launches connects to that
+database.
+
 The plugin no longer calls `tools.lazy_deps.install_specs` from anywhere. On package-manager Hermes
 that is a retired shim which handed the process to the updater and exited instead of installing, so
 every `hermes` invocation became a ~40s "update" that drained `hermes-gateway` and still left the
@@ -302,6 +307,13 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `prefetch_waits_for_retain` | `true` | Before the background recall for the next turn, wait until the turn just saved can be found, so recall includes it. Runs off the reply path and adds no response time. |
 | `prefetch_retain_drain_timeout` | `10` | Most seconds that background recall waits for the save above before recalling anyway |
 
+**When a save fails.** Automatic saves are not dropped on the first error:
+
+- If the server can't be reached, times out or answers with a 5xx, the save is kept and sent again before the next one (and once more at exit), up to 5 tries. Each save carries its own operation id, so a resend the server already received is not stored twice.
+- If the server accepts a save and its processing fails later, the plugin asks the server to retry it, up to 3 times. It checks before each new save, so a failure after the process exits is not retried; retry it from the control plane.
+- If the bank keeps no document text (`store_document_text` off), it can't append to a session document. The plugin then stops appending and stores the turns in a separate document per process instead.
+- An error that can never succeed (any other 4xx) is logged and the save is dropped.
+
 ### Integration
 
 | Key | Default | Description |
@@ -424,9 +436,12 @@ so a fact pruned from the size-capped file is not lost. Removals are not mirrore
 Check `hermes memory status` reports `hindsight` as the active provider and `Status: available`. In
 `memory_mode: context` the tools are hidden on purpose.
 
-**`Status: not available` in `local_embedded`** — this plugin's own packages
-(`hindsight-client`, `hindsight-embed`) are missing from the environment, which happens when a venv
-rebuild dropped the plugin member. Run `hermes pm repair` and restart Hermes to rebuild them. The Hindsight server is *not* needed in that venv — it runs as a separate
+**`Status: not available`, or `No module named 'hindsight_client'`** — this plugin's own packages
+(`hindsight-client`, and `hindsight-embed` for `local_embedded`) are missing from the environment
+Hermes is running in. That happens when a venv rebuild dropped the plugin member, or when the gateway
+started before the plugin was installed: a running gateway keeps the environment it started with.
+Run `hermes pm repair`, then `hermes gateway restart` — restarting the desktop app alone does not
+restart a detached gateway. The Hindsight server is *not* needed in that venv — it runs as a separate
 process, and first use downloads it if no `hindsight-api` binary is present yet.
 
 **`Timeout context manager should be used inside a task`** — `hindsight-embed` 0.10.0. Run

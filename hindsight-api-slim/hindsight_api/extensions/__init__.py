@@ -42,7 +42,7 @@ from hindsight_api.extensions.memory_defense import (
     apply_redaction,
     parse_policy,
 )
-from hindsight_api.extensions.model_call import ModelCall, ModelCallExtension
+from hindsight_api.extensions.model_call import ModelCall, ModelCallExtension, OperationRun
 from hindsight_api.extensions.operation_validator import (
     # Bank Management operations
     BankListContext,
@@ -55,16 +55,26 @@ from hindsight_api.extensions.operation_validator import (
     # Consolidation operation
     ConsolidateContext,
     ConsolidateResult,
+    ConsolidationActionsContext,
     CreateBankContext,
+    CreateKnowledgeBankContext,
     # File Conversion
     FileConvertResult,
     # Transfer imports
     ImportArchiveDocument,
     ImportContext,
+    KnowledgeBankListContext,
+    KnowledgeBankReadContext,
+    KnowledgeBankReadOperation,
+    KnowledgeBankWriteContext,
+    KnowledgeBankWriteOperation,
     # Memory curation
     MemoryCurationAction,
+    # Memory review
+    MemoryReview,
     MemoryUpdateContext,
     MemoryUpdateResult,
+    MentalModelCandidateContext,
     # Mental Model operations
     MentalModelGetContext,
     MentalModelGetResult,
@@ -81,8 +91,11 @@ from hindsight_api.extensions.operation_validator import (
     ReflectResultContext,
     RetainAttachmentInfo,
     RetainContext,
+    RetainFactsContext,
     RetainResult,
     RetainSource,
+    ReviewedConsolidationAction,
+    ReviewedFact,
     TagScopeContext,
     ValidationResult,
 )
@@ -115,6 +128,7 @@ __all__ = [
     # Model Call Extension
     "ModelCall",
     "ModelCallExtension",
+    "OperationRun",
     # Operation Validator - Core
     "DeferOperation",
     "OperationValidationError",
@@ -142,9 +156,20 @@ __all__ = [
     "BankWriteOperation",
     "TagScopeContext",
     "CreateBankContext",
+    "CreateKnowledgeBankContext",
+    "KnowledgeBankListContext",
+    "KnowledgeBankReadContext",
+    "KnowledgeBankReadOperation",
+    "KnowledgeBankWriteContext",
+    "KnowledgeBankWriteOperation",
     # Operation Validator - Consolidation
     "ConsolidateContext",
     "ConsolidateResult",
+    "ConsolidationActionsContext",
+    "MemoryReview",
+    "RetainFactsContext",
+    "ReviewedConsolidationAction",
+    "ReviewedFact",
     # Operation Validator - File Conversion
     "FileConvertResult",
     # Operation Validator - Memory curation
@@ -154,6 +179,7 @@ __all__ = [
     # Operation Validator - Mental Model
     "MentalModelGetContext",
     "MentalModelGetResult",
+    "MentalModelCandidateContext",
     "MentalModelRefreshContext",
     "MentalModelRefreshResult",
     # Tenant/Auth

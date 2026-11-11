@@ -51,18 +51,28 @@ async def document_updated_at(
 
 
 async def load_existing_chunks(
-    *, conn, fq_table: Callable[[str], str], bank_id: str, document_id: str
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    document_id: str,
+    chunk_indices: list[int] | None = None,
 ) -> list[ExistingChunk]:
-    """The document's chunk ids, indexes and content hashes, in chunk order."""
+    """The document's chunk ids, indexes and content hashes, in chunk order.
+
+    ``chunk_indices`` limits the read to those positions.
+    """
+    only_indices = "" if chunk_indices is None else "AND chunk_index = ANY($3::integer[])"
     rows = await conn.fetch(
         f"""
         SELECT chunk_id, chunk_index, content_hash
         FROM {fq_table("chunks")}
-        WHERE document_id = $1 AND bank_id = $2
+        WHERE document_id = $1 AND bank_id = $2 {only_indices}
         ORDER BY chunk_index
         """,
         document_id,
         bank_id,
+        *([] if chunk_indices is None else [chunk_indices]),
     )
     return [
         ExistingChunk(
@@ -142,21 +152,15 @@ async def load_document_chunks(
     from ...db_utils import acquire_with_retry
 
     async with acquire_with_retry(pool) as conn:
-        if include_text:
-            doc_row_at_load = await conn.fetchrow(
-                f"SELECT content_hash, original_text FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
-                document_id,
-                bank_id,
-            )
-            doc_hash_at_load = doc_row_at_load["content_hash"] if doc_row_at_load else None
-            original_text_at_load = doc_row_at_load["original_text"] if doc_row_at_load else None
-        else:
-            doc_hash_at_load = await conn.fetchval(
-                f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
-                document_id,
-                bank_id,
-            )
-            original_text_at_load = None
+        doc_row_at_load = await conn.fetchrow(
+            f"SELECT content_hash, tags{', original_text' if include_text else ''} "
+            f"FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
+            document_id,
+            bank_id,
+        )
+        doc_hash_at_load = doc_row_at_load["content_hash"] if doc_row_at_load else None
+        original_text_at_load = doc_row_at_load["original_text"] if doc_row_at_load and include_text else None
+        tags_at_load = list(doc_row_at_load["tags"] or []) if doc_row_at_load else None
 
         # Load chunks after the document version. If a concurrent writer commits
         # between these reads, the hash precondition on metadata-only writes (or
@@ -165,7 +169,7 @@ async def load_document_chunks(
             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
         )
     return DocumentChunkState(
-        content_hash=doc_hash_at_load, original_text=original_text_at_load, chunks=existing_chunks
+        content_hash=doc_hash_at_load, original_text=original_text_at_load, chunks=existing_chunks, tags=tags_at_load
     )
 
 
@@ -472,7 +476,10 @@ async def delete_chunks(*, conn, fq_table: Callable[[str], str], bank_id: str, c
                 LEAST(ml.from_unit_id, ml.to_unit_id),
                 GREATEST(ml.from_unit_id, ml.to_unit_id),
                 ml.link_type,
-                COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid)
+                COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid),
+                -- Breaks the tie between the two rows of a pair written both ways, which
+                -- otherwise lock in either order (#6051). Same order as ops.delete_unit_links.
+                ml.from_unit_id
             FOR UPDATE OF ml
         )
         DELETE FROM {fq_table("memory_links")} ml

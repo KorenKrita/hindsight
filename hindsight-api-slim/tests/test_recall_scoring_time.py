@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from hindsight_api.engine import memory_engine
-from hindsight_api.engine.memory_engine import Budget
+from hindsight_api.engine.response_models import Budget
 from hindsight_api.engine.search.reranking import RerankResult
 from hindsight_api.engine.search.retrieval import MultiFactTypeRetrievalResult, ParallelRetrievalResult
 from hindsight_api.engine.search.types import RetrievalResult, ScoredResult
@@ -25,7 +25,7 @@ class _Reranker:
     async def ensure_initialized(self) -> None:
         return None
 
-    async def rerank(self, _query: str, candidates: list[Any], now=None) -> RerankResult:
+    async def rerank(self, _query: str, candidates: list[Any], now=None, **_options) -> RerankResult:
         return RerankResult(
             results=[
                 ScoredResult(
@@ -141,3 +141,14 @@ async def test_recall_async_passes_question_date_to_combined_scoring(monkeypatch
 
     assert [fact.text for fact in result.results] == ["Alice likes machine learning."]
     assert captured_now == datetime(2023, 5, 30, 13, 53, tzinfo=UTC)
+
+
+def test_recall_dates_render_as_iso_and_strings_pass_through():
+    """A recall's fact dates go out as ISO strings; a store that already returns strings (or no date) is left alone."""
+    from datetime import date
+
+    to_iso = memory_engine._iso_or_passthrough
+    assert to_iso(datetime(2024, 1, 15, 10, 30, tzinfo=UTC)) == "2024-01-15T10:30:00+00:00"
+    assert to_iso(date(2024, 1, 15)) == "2024-01-15"
+    assert to_iso("2024-01-15T10:30:00Z") == "2024-01-15T10:30:00Z"
+    assert to_iso(None) is None

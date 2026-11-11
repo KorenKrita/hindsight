@@ -16,6 +16,7 @@ from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 from types import UnionType
 from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hindsight_api.config import (
     RECALL_BUDGET_FUNCTIONS,
@@ -27,7 +28,8 @@ from hindsight_api.config import (
     validate_retain_completion_token_budget,
     validate_retain_image_chunking_config,
 )
-from hindsight_api.engine.memory_engine import fq_table
+from hindsight_api.engine.response_models import MentalModelTrigger, ReflectDefaultOptions
+from hindsight_api.engine.schema import fq_table
 from hindsight_api.extensions.tenant import TenantExtension
 from hindsight_api.models import RequestContext
 
@@ -583,8 +585,8 @@ class ConfigResolver:
 
         # Both of these are merged into a request the API also accepts directly, so
         # hold them to the same contract as the request that carries those fields.
-        if normalized_updates.get("knowledge_page_default_trigger") is not None:
-            _validate_knowledge_page_default_trigger(normalized_updates["knowledge_page_default_trigger"])
+        if normalized_updates.get("page_default_trigger") is not None:
+            _validate_page_default_trigger(normalized_updates["page_default_trigger"])
         if normalized_updates.get("reflect_default_options") is not None:
             _validate_reflect_default_options(normalized_updates["reflect_default_options"])
 
@@ -625,6 +627,16 @@ class ConfigResolver:
 
         # Validate recall budget fields
         _validate_recall_budget_updates(normalized_updates)
+
+        # A zone name nothing can load would break every retain on the bank.
+        if normalized_updates.get("default_timezone") is not None:
+            try:
+                ZoneInfo(normalized_updates["default_timezone"])
+            except (ZoneInfoNotFoundError, ValueError, TypeError):
+                raise ValueError(
+                    f"default_timezone must be an IANA zone name such as 'Europe/Rome', "
+                    f"got {normalized_updates['default_timezone']!r}"
+                ) from None
 
         # Validate disposition trait fields (1-5 integer scale)
         _validate_disposition_updates(normalized_updates)
@@ -833,17 +845,13 @@ def _validate_against_model(key: str, value: dict[str, Any], model: "type[BaseMo
         raise ValueError(f"Invalid {key}: {problems}") from e
 
 
-def _validate_knowledge_page_default_trigger(value: dict[str, Any]) -> None:
+def _validate_page_default_trigger(value: dict[str, Any]) -> None:
     """Reject unknown trigger fields and values ``MentalModelTrigger`` refuses."""
-    from hindsight_api.api.http import MentalModelTrigger
-
-    _validate_against_model("knowledge_page_default_trigger", value, MentalModelTrigger, "trigger")
+    _validate_against_model("page_default_trigger", value, MentalModelTrigger, "trigger")
 
 
 def _validate_reflect_default_options(value: dict[str, Any]) -> None:
     """Reject unknown option fields and values ``ReflectDefaultOptions`` refuses."""
-    from hindsight_api.api.http import ReflectDefaultOptions
-
     _validate_against_model("reflect_default_options", value, ReflectDefaultOptions, "options")
 
 

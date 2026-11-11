@@ -104,6 +104,23 @@ def _migrate_label_group(raw: dict) -> dict:
     return patched
 
 
+def migrate_entity_labels_input(value: Any) -> Any:
+    """Pydantic ``mode='before'`` hook: migrate legacy entity-label dicts before ``LabelGroup`` validation.
+
+    Keeps the request boundary accepting the legacy ``free_values``/``multi_value`` shape (translated to
+    the ``type`` field) that ``parse_entity_labels`` already tolerates on the storage-read side, so typing
+    the field as ``list[LabelGroup]`` (which publishes the schema in OpenAPI) does not drop those keys.
+
+    Also unwraps the ``{"attributes": [...]}`` envelope that ``parse_entity_labels`` accepts and the
+    config API stores, so a bank configured that way still exports its labels (#6057).
+    """
+    if isinstance(value, dict) and "attributes" in value:
+        value = value["attributes"]
+    if isinstance(value, list):
+        return [_migrate_label_group(item) if isinstance(item, dict) else item for item in value]
+    return value
+
+
 def _build_map_fields_model(fields: dict[str, MapField], model_name: str) -> type[BaseModel] | None:
     """
     Build a dynamic Pydantic model for a set of map fields (recursive).
@@ -356,3 +373,23 @@ def split_label_tags(tags: "list[str] | None", keys: "set[str] | None") -> list[
     if not tags or not keys:
         return []
     return [t for t in tags if ":" in t and t.split(":", 1)[0].lower() in keys]
+
+
+def carried_label_tags(
+    existing: "list[str] | None", keys: "set[str] | None", document_tags: "list[str] | None"
+) -> list[str]:
+    """The label tags a unit keeps when its document's tags are rewritten without re-extracting it.
+
+    A unit's tags are its document's tags plus its own label projection. A ``key:value`` tag the
+    document itself does not carry can only have come from that projection, so it is kept even
+    when its group has since left the bank's ``entity_labels`` config (issue #6336): dropping a
+    group stops new extraction from assigning it, it does not rewrite facts extracted while it
+    existed. The current config's keys are still honoured, for a label tag that happens to equal
+    a document tag. ``document_tags`` is the document's tags BEFORE the rewrite; ``None`` (not
+    readable) falls back to the config keys alone.
+    """
+    if not existing:
+        return []
+    by_config = set(split_label_tags(existing, keys))
+    doc = set(document_tags) if document_tags is not None else None
+    return [t for t in existing if t in by_config or (doc is not None and ":" in t and t not in doc)]

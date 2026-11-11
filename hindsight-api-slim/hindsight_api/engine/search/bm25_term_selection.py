@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from ..memory_engine import get_current_schema
+from hindsight_api.schema_context import get_current_schema
 
 if TYPE_CHECKING:
     from ...config import ConfigLike
@@ -130,7 +130,7 @@ async def build_bm25_query_text(
 ) -> str:
     """Turn query tokens into the text parameter a BM25 arm binds.
 
-    Every BM25 arm — memory recall over ``memory_units`` and knowledge search over
+    Every BM25 arm — memory recall over ``memory_units`` and page search over
     ``mental_models`` — goes through here, so the two cannot drift apart again: the
     native backend gets one disjunctive ``tok | tok`` tsquery on both paths, and the
     other backends get the raw query text their own parsers expect.

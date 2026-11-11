@@ -56,6 +56,7 @@ from hindsight_api.extensions import (
     ValidationResult,
 )
 from hindsight_api.webhooks.manager import WebhookManager
+from tests.llm_trace_drain import drain_traces
 from tests.retain_result_capture import RetainResultCapture
 
 
@@ -286,6 +287,14 @@ async def test_documents_written_in_one_batch_keep_their_own_facts_chunks_and_ca
         await memory.delete_bank(dst, request_context=request_context)
 
 
+def test_every_dumped_table_has_an_export_order():
+    """_dump_bank_rows orders by _DUMP_ORDER_BY[table]; a carried table missing from it would
+    only fail at export time (#5998)."""
+    from hindsight_api.engine.transfer.export import _BANK_ROW_TABLES, _DUMP_ORDER_BY
+
+    assert set(_DUMP_ORDER_BY) == set(_BANK_ROW_TABLES)
+
+
 def test_export_bank_covers_schema():
     """Every bank-scoped table must be classified by export_bank — logical, carried,
     history, or explicitly skipped — so a future migration can't silently drop one."""
@@ -352,11 +361,11 @@ def test_remap_mental_model_evidence_updates_current_and_history():
 def test_topological_page_order_is_parent_first():
     """Nodes always sort so a parent precedes its children (self-FK safe)."""
     from hindsight_api.engine.transfer.importer import _topological_page_order
-    from hindsight_api.engine.transfer.schema import TransferKnowledgePage
+    from hindsight_api.engine.transfer.schema import TransferPage
 
     def _page(pid, parent):
         kind = "page" if pid.startswith("p") else "folder"
-        return TransferKnowledgePage(id=pid, parent_id=parent, kind=kind, name=pid)
+        return TransferPage(id=pid, parent_id=parent, kind=kind, name=pid)
 
     # Deliberately shuffled: child before parent, grandchild before both.
     pages = [_page("pC", "fB"), _page("fB", "fA"), _page("fA", None), _page("pRoot", None)]
@@ -370,14 +379,14 @@ def test_topological_page_order_tolerates_cycles_and_dangling_parents():
     """A cycle or missing parent (only possible in a corrupt export) is emitted
     rather than dropped, so the DB FK — not a silent loss — surfaces it."""
     from hindsight_api.engine.transfer.importer import _topological_page_order
-    from hindsight_api.engine.transfer.schema import TransferKnowledgePage
+    from hindsight_api.engine.transfer.schema import TransferPage
 
     cycle = [
-        TransferKnowledgePage(id="a", parent_id="b", kind="folder", name="a"),
-        TransferKnowledgePage(id="b", parent_id="a", kind="folder", name="b"),
+        TransferPage(id="a", parent_id="b", kind="folder", name="a"),
+        TransferPage(id="b", parent_id="a", kind="folder", name="b"),
     ]
     assert {p.id for p in _topological_page_order(cycle)} == {"a", "b"}
-    dangling = [TransferKnowledgePage(id="x", parent_id="missing", kind="page", name="x")]
+    dangling = [TransferPage(id="x", parent_id="missing", kind="page", name="x")]
     assert [p.id for p in _topological_page_order(dangling)] == ["x"]
 
 
@@ -1000,18 +1009,16 @@ async def test_bank_roundtrip_carries_mental_model_history(memory, request_conte
 @pytest.mark.asyncio
 @pytest.mark.memory_backend_incompatible
 async def test_bank_roundtrip_carries_knowledge_pages(memory, request_context):
-    """A whole-bank archive restores the Knowledge Pages tree — nested folders +
+    """A whole-bank archive restores the Pages tree — nested folders +
     pages, parent_id / mental_model_id / managed / sort_order preserved — and
     regenerates each backing mental model's embedding + lexical state on the
     target, so pages stay searchable after import (#3308, #3323)."""
     bank = _unique_bank("bank_kb")
     try:
         await memory.ensure_bank_profile(bank, request_context=request_context)
-        root = await memory.create_knowledge_folder(bank, "Runbooks", managed=True, request_context=request_context)
-        sub = await memory.create_knowledge_folder(
-            bank, "Billing", parent_id=root["id"], request_context=request_context
-        )
-        page = await memory.create_knowledge_page(
+        root = await memory.create_page_folder(bank, "Runbooks", managed=True, request_context=request_context)
+        sub = await memory.create_page_folder(bank, "Billing", parent_id=root["id"], request_context=request_context)
+        page = await memory.create_page(
             bank,
             name="Net-30 policy",
             source_query="what is our billing policy",
@@ -1020,7 +1027,7 @@ async def test_bank_roundtrip_carries_knowledge_pages(memory, request_context):
             request_context=request_context,
         )
         # A root-level page (NULL parent) exercises the non-nested path too.
-        await memory.create_knowledge_page(
+        await memory.create_page(
             bank,
             name="Overview",
             source_query="overview",
@@ -1041,10 +1048,8 @@ async def test_bank_roundtrip_carries_knowledge_pages(memory, request_context):
                 (n["id"], n["kind"], n["parent_id"], n["mental_model_id"], n["managed"], n["name"]) for n in nodes
             )
 
-        before = _tree(await memory.list_knowledge_nodes(bank, request_context=request_context))
-        before_search = await memory.search_knowledge_pages(
-            bank, "net-30 billing", limit=5, request_context=request_context
-        )
+        before = _tree(await memory.list_page_nodes(bank, request_context=request_context))
+        before_search = await memory.search_pages(bank, "net-30 billing", limit=5, request_context=request_context)
         assert any(r["id"] == page["id"] for r in before_search), "page should be searchable before export"
 
         from hindsight_api.engine.transfer import export_bank
@@ -1063,20 +1068,18 @@ async def test_bank_roundtrip_carries_knowledge_pages(memory, request_context):
         assert result.mental_models_imported == 1
 
         # Tree restored exactly: ids, parents, backing mental models, managed flag.
-        after = _tree(await memory.list_knowledge_nodes(bank, request_context=request_context))
+        after = _tree(await memory.list_page_nodes(bank, request_context=request_context))
         assert after == before
 
         # Backing mental models re-embedded on the target (no NULL vectors), so both
-        # the vector and lexical arms of knowledge search work again.
+        # the vector and lexical arms of page search work again.
         async with acquire_with_retry(backend) as conn:
             null_embeddings = await conn.fetchval(
                 f"SELECT count(*) FROM {fq_store_table('mental_models')} WHERE bank_id = $1 AND embedding IS NULL",
                 bank,
             )
         assert null_embeddings == 0, "restored mental models must be re-embedded"
-        after_search = await memory.search_knowledge_pages(
-            bank, "net-30 billing", limit=5, request_context=request_context
-        )
+        after_search = await memory.search_pages(bank, "net-30 billing", limit=5, request_context=request_context)
         assert any(r["id"] == page["id"] for r in after_search), "page must be searchable after import"
     finally:
         await memory.delete_bank(bank, request_context=request_context)
@@ -1559,11 +1562,11 @@ def test_document_batches_cap_documents_and_facts(monkeypatch):
 @pytest.mark.memory_backend_incompatible
 async def test_export_import_mental_models_and_knowledge_pages(memory, request_context):
     """The document-transfer flags carry optional bank knowledge into a target bank."""
-    source = _unique_bank("transfer_knowledge_src")
-    target = _unique_bank("transfer_knowledge_dst")
+    source = _unique_bank("transfer_pages_src")
+    target = _unique_bank("transfer_pages_dst")
     try:
         await _retain(memory, source, "Alice works at Google.", request_context, "doc-1")
-        page = await memory.create_knowledge_page(
+        page = await memory.create_page(
             source,
             name="Work policy",
             source_query="what is the work policy",
@@ -1600,15 +1603,11 @@ async def test_export_import_mental_models_and_knowledge_pages(memory, request_c
         # Both rows arrive; only the standalone one counts as a mental model.
         mental_models = await memory.list_mental_models(target, with_staleness=True, request_context=request_context)
         assert {m["name"] for m in mental_models.items} == {"Work policy", "Coding preferences"}
-        standalone = await memory.list_mental_models(
-            target, exclude_knowledge_pages=True, request_context=request_context
-        )
+        standalone = await memory.list_mental_models(target, exclude_pages=True, request_context=request_context)
         assert [m["name"] for m in standalone.items] == ["Coding preferences"]
-        nodes = await memory.list_knowledge_nodes(target, request_context=request_context)
+        nodes = await memory.list_page_nodes(target, request_context=request_context)
         assert [(node["name"], node["mental_model_id"]) for node in nodes] == [("Work policy", page["mental_model_id"])]
-        search_results = await memory.search_knowledge_pages(
-            target, "work policy", limit=5, request_context=request_context
-        )
+        search_results = await memory.search_pages(target, "work policy", limit=5, request_context=request_context)
         assert any(result["name"] == "Work policy" for result in search_results)
     finally:
         await memory.delete_bank(source, request_context=request_context)
@@ -2752,7 +2751,7 @@ async def test_export_bank_of_a_store_owned_bank_carries_its_memories():
     """The whole-bank archive takes memories from the store and everything else from SQL.
 
     `export_bank` is a superset of the document export: only the memories move, while bank config,
-    mental models, directives, webhooks, knowledge pages and the history tails stay in Postgres for
+    mental models, directives, webhooks, pages and the history tails stay in Postgres for
     every deployment. Both halves are asserted, because routing all of it to the store would lose
     the config and routing none of it would lose the memories.
     """
@@ -3100,6 +3099,11 @@ async def test_streamed_bank_archive_matches_the_built_one(memory, request_conte
         await _retain(memory, bank, "Grace shared a diagram of the Paris office.", request_context, "doc-1")
         await _retain(memory, bank, "Alan moved to Berlin in 2021.", request_context, "doc-2")
         await _seed_attachment(memory, bank, b"\x89PNG-parity", "b" * 64)
+        # Retain returns before its LLM trace and audit rows are written (they are
+        # fire-and-forget). Let them land, or one arrives between the two exports
+        # and the history sections differ for a reason that is not the format.
+        await drain_traces(memory)
+        await memory._audit_logger.drain()
         backend = await memory._get_backend()
         scope = TransferScope(data=True, bank_config=True, history=True)
         streamed = b"".join(
@@ -3628,6 +3632,64 @@ async def test_paged_sections_survive_a_page_boundary(memory, request_context, m
         result = await memory.import_bank_async(io.BytesIO(archive), request_context, target_bank_id=target)
         assert result.invalidated_memories_imported == len(invalidated)
         assert result.maintenance_queue_rows_imported >= queued
+    finally:
+        await memory.delete_bank(source, request_context=request_context)
+        await memory.delete_bank(target, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_a_big_mental_model_history_moves_without_being_held_whole(memory, request_context):
+    """Export and import stream the mental-model history a page at a time (#6259).
+
+    Every refresh stores a full snapshot of the model, so a busy bank's history runs to
+    gigabytes; it was read as one list on export and parsed as one list on import, and
+    OOM-killed the API. The rows must also come back oldest-first, under the new bank.
+    """
+    import tracemalloc
+
+    from hindsight_api.engine.transfer import TransferScope, stream_export_bank
+
+    source, target = _unique_bank("big_mm_hist"), _unique_bank("big_mm_hist_copy")
+    rows, payload_bytes = 2000, 50_000
+    history_bytes = rows * payload_bytes
+    try:
+        await _retain(memory, source, "Alan moved to Berlin in 2021.", request_context, "doc-1")
+        await memory.create_mental_model(
+            source,
+            name="Moves",
+            source_query="where did Alan move",
+            content="Alan moved to Berlin.",
+            mental_model_id="mm-big",
+            request_context=request_context,
+        )
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            # Seeded directly: the refresh path caps the history, and a fast test can't run 2000 refreshes.
+            await conn.executemany(
+                f"INSERT INTO {fq_store_table('mental_model_history')} (mental_model_id, bank_id, content, changed_at) "
+                f"VALUES ('mm-big', $1, $2::jsonb, now())",
+                [(source, json.dumps({"previous_content": f"{seq:05d}" + "x" * payload_bytes})) for seq in range(rows)],
+            )
+
+        tracemalloc.start()
+        try:
+            # The snapshots compress to almost nothing, so the archive itself barely counts.
+            archive = b"".join(
+                [chunk async for chunk in stream_export_bank(backend, source, scope=TransferScope(data=True))]
+            )
+            _, export_peak = tracemalloc.get_traced_memory()
+            tracemalloc.reset_peak()
+            result = await memory.import_bank_async(io.BytesIO(archive), request_context, target_bank_id=target)
+            _, import_peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert result.mental_model_history_imported == rows
+        assert export_peak < history_bytes / 2, f"export peaked at {export_peak / 1e6:.0f} MB"
+        assert import_peak < history_bytes / 2, f"import peaked at {import_peak / 1e6:.0f} MB"
+        # Newest first; every row shares one changed_at, so this order is the reassigned ids' tie-break.
+        history = await memory.get_mental_model_history(target, "mm-big", request_context=request_context)
+        assert [int(h["previous_content"][:5]) for h in history] == list(reversed(range(rows)))
     finally:
         await memory.delete_bank(source, request_context=request_context)
         await memory.delete_bank(target, request_context=request_context)

@@ -2,6 +2,7 @@
 Test search tracing functionality.
 """
 
+import dataclasses
 import itertools
 import time
 from datetime import datetime, timezone
@@ -15,25 +16,30 @@ import pytest
 # behaviour is covered by the extension's own recall suite instead.
 pytestmark = pytest.mark.memory_backend_incompatible
 
-from hindsight_api.engine.memory_engine import Budget
+from hindsight_api.config import _get_raw_config
+from hindsight_api.engine import memory_engine as memory_engine_mod
+from hindsight_api.engine.response_models import Budget
 from hindsight_api.engine.search.tracer import SearchTracer
+from hindsight_api.engine.search.types import MergedCandidate, RetrievalResult
 
 
-def test_rrf_trace_preserves_flattened_source_ranks():
-    """Source ranks flattened by the recall pipeline remain visible in traces."""
+def test_rrf_trace_preserves_source_ranks():
+    """Each candidate's per-arm ranks from the fusion remain visible in traces."""
     tracer = SearchTracer(query="test", budget=10, max_tokens=100)
 
     tracer.add_rrf_merged(
         [
-            (
-                "memory-1",
-                {"text": "alpha"},
-                {"rrf_score": 0.1, "semantic_rank": 1, "bm25_rank": 2},
+            MergedCandidate(
+                retrieval=RetrievalResult(id="memory-1", text="alpha", fact_type="world"),
+                rrf_score=0.1,
+                source_ranks={"semantic_rank": 1, "bm25_rank": 2},
             )
         ]
     )
 
-    assert tracer.rrf_merged[0].source_ranks == {"semantic_rank": 1, "bm25_rank": 2}
+    merged = tracer.rrf_merged[0]
+    assert (merged.node_id, merged.text, merged.rrf_score) == ("memory-1", "alpha", 0.1)
+    assert merged.source_ranks == {"semantic_rank": 1, "bm25_rank": 2}
 
 
 def test_trace_timestamp_records_the_query_anchor():
@@ -71,6 +77,16 @@ def test_trace_duration_survives_a_wall_clock_step_back(monkeypatch):
 
 
 @pytest.mark.asyncio
+def test_trace_reports_the_reranker_that_scored_the_recall():
+    """The serving reranker reaches the trace; None when no cross-encoder ran (#6072)."""
+    tracer = SearchTracer(query="test", budget=10, max_tokens=100)
+    tracer.start()
+    assert tracer.finalize([]).reranker_provider is None
+
+    tracer.reranker_provider = "local"
+    assert tracer.finalize([]).reranker_provider == "local"
+
+
 async def test_search_with_trace(memory, request_context):
     """Test that search with enable_trace=True returns a valid SearchTrace."""
     # Generate a unique agent ID for this test
@@ -122,6 +138,8 @@ async def test_search_with_trace(memory, request_context):
         assert trace["query"]["query_text"] == "Who works at Google?"
         assert trace["query"]["budget"] == 100  # Budget.LOW = 100
         assert trace["query"]["max_tokens"] == 512
+        # Off by default: the reranker setup is not exposed unless the server opts in (#6072)
+        assert trace["reranker_provider"] is None
         # The anchor the caller asked for, not the moment the trace was built (#4217)
         assert trace["query"]["timestamp"] == question_date
         assert len(trace["query"]["query_embedding"]) > 0, "Query embedding should be populated"
@@ -293,4 +311,33 @@ async def test_search_without_trace(memory, request_context):
 
     finally:
         # Cleanup
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_trace_names_the_reranker_when_the_server_opts_in(memory, request_context, monkeypatch):
+    """With RECALL_TRACE_RERANKER_PROVIDER on, the trace names the member that scored the recall (#6072)."""
+    config = dataclasses.replace(_get_raw_config(), recall_trace_reranker_provider=True)
+    monkeypatch.setattr(memory_engine_mod, "get_config", lambda: config)
+    bank_id = f"test_trace_reranker_{datetime.now(timezone.utc).timestamp()}"
+
+    try:
+        await memory.retain_async(
+            bank_id=bank_id,
+            content="Alice works at Google in Mountain View",
+            context="test",
+            request_context=request_context,
+        )
+        search_result = await memory.recall_async(
+            bank_id=bank_id,
+            query="Who works at Google?",
+            fact_type=["world"],
+            budget=Budget.LOW,
+            max_tokens=512,
+            enable_trace=True,
+            request_context=request_context,
+        )
+
+        assert search_result.trace["reranker_provider"] == "local"
+    finally:
         await memory.delete_bank(bank_id, request_context=request_context)

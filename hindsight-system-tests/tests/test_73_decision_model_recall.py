@@ -90,3 +90,122 @@ async def test_a_rank_position_is_not_published_or_floored(decision_model_client
             bank_id=bank, query="Where did Alice move to?", min_scores={"reranker": 0.5}
         )
     assert exc.value.status == 400
+
+
+TEA = "Marta's favourite tea is genmaicha"
+TEA_AGAIN = "Marta's favorite tea is genmaicha"
+SENCHA = "Marta drinks sencha in the afternoon"
+UNRELATED = "Marta set up the staging cluster on Kubernetes"
+
+
+@pytest.fixture
+async def tea_bank(decision_model_prune_client, hindsight_server, llm) -> AsyncIterator[str]:
+    """A fact, a reworded repeat of it, a second fact and an unrelated one."""
+    bank = f"systest-{uuid.uuid4().hex[:12]}"
+    llm.on_step("extract_facts").returns(
+        extracted(
+            fact(TEA, who="Marta", entities=["Marta", "genmaicha"]),
+            fact(TEA_AGAIN, who="Marta", entities=["Marta", "genmaicha"]),
+            fact(SENCHA, who="Marta", entities=["Marta", "sencha"]),
+            fact(UNRELATED, who="Marta", entities=["Marta", "Kubernetes"]),
+        )
+    )
+    llm.on_step("consolidate").returns(consolidation())
+    await decision_model_prune_client.aretain(bank_id=bank, content="Marta's teas, and the staging cluster.")
+    await wait_until_settled(decision_model_prune_client, bank)
+    yield bank
+    with contextlib.suppress(Exception):
+        await decision_model_prune_client.banks.delete_bank(bank)
+
+
+async def test_pruning_drops_what_is_no_help(decision_model_prune_client, tea_bank, stubs):
+    """With HINDSIGHT_API_RECALL_DECISION_MODEL_PRUNE on, the client does not get the memory
+    judged no help. Repeats are not pruned: both copies of the tea fact come back."""
+    stubs.rerank.verdicts = {TEA: 0.9, TEA_AGAIN: 0.85, SENCHA: 0.8, UNRELATED: 0.05}
+
+    response = await decision_model_prune_client.arecall(bank_id=tea_bank, query="What tea does Marta like?")
+
+    assert _texts(response) == [TEA, TEA_AGAIN, SENCHA]
+
+
+async def test_without_pruning_every_candidate_comes_back(decision_model_client, tea_bank, stubs):
+    """The same bank and verdicts on a server without the flag: the unrelated memory is
+    only ordered last, not dropped."""
+    stubs.rerank.verdicts = {TEA: 0.9, TEA_AGAIN: 0.85, SENCHA: 0.8, UNRELATED: 0.05}
+
+    response = await decision_model_client.arecall(bank_id=tea_bank, query="What tea does Marta like?")
+
+    assert _texts(response) == [TEA, TEA_AGAIN, SENCHA, UNRELATED]
+
+
+async def test_a_request_turns_prune_and_dedup_on(decision_model_client, tea_bank, stubs):
+    """On a server with neither flag, the request asks for both: the repeat of the tea fact
+    and the memory judged no help are left out; a different fact about Marta stays."""
+    stubs.rerank.verdicts = {TEA: 0.9, TEA_AGAIN: 0.85, SENCHA: 0.8, UNRELATED: 0.05}
+    stubs.rerank.repeats = {(TEA, TEA_AGAIN)}
+    query = "What tea does Marta like?"
+
+    dedup_only = await decision_model_client.arecall(bank_id=tea_bank, query=query, rerank={"dedup": True})
+    both = await decision_model_client.arecall(
+        bank_id=tea_bank, query=query, rerank={"prune": True, "dedup": True}
+    )
+
+    assert _texts(dedup_only) == [TEA, SENCHA, UNRELATED]
+    assert _texts(both) == [TEA, SENCHA]
+
+
+async def test_a_request_turns_the_servers_prune_off(decision_model_prune_client, tea_bank, stubs):
+    """The server default is only a default: a request saying rerank.prune=false gets everything."""
+    stubs.rerank.verdicts = {TEA: 0.9, TEA_AGAIN: 0.85, SENCHA: 0.8, UNRELATED: 0.05}
+
+    response = await decision_model_prune_client.arecall(
+        bank_id=tea_bank, query="What tea does Marta like?", rerank={"prune": False}
+    )
+
+    assert _texts(response) == [TEA, TEA_AGAIN, SENCHA, UNRELATED]
+
+
+async def test_the_bank_sets_dedup_for_requests_that_omit_it(decision_model_client, tea_bank, stubs):
+    """A bank with recall_decision_model_dedup on dedups every recall that does not say
+    otherwise, and a request can still turn it off."""
+    stubs.rerank.verdicts = {TEA: 0.9, TEA_AGAIN: 0.85, SENCHA: 0.8, UNRELATED: 0.05}
+    stubs.rerank.repeats = {(TEA, TEA_AGAIN)}
+    await decision_model_client.aupdate_bank_config(tea_bank, recall_decision_model_dedup=True)
+    query = "What tea does Marta like?"
+
+    omitted = await decision_model_client.arecall(bank_id=tea_bank, query=query)
+    off = await decision_model_client.arecall(bank_id=tea_bank, query=query, rerank={"dedup": False})
+
+    assert _texts(omitted) == [TEA, SENCHA, UNRELATED]
+    assert _texts(off) == [TEA, TEA_AGAIN, SENCHA, UNRELATED]
+
+
+async def test_a_failing_decision_model_fails_the_recall_by_default(decision_model_client, bank, stubs):
+    """Without HINDSIGHT_API_RECALL_DECISION_MODEL_FALLBACK, a ranking the decision model cannot
+    give is an error the client sees, not a quietly worse answer (#6242)."""
+    stubs.rerank.fail_with_status = 400
+
+    with pytest.raises(ApiException) as exc:
+        await decision_model_client.arecall(bank_id=bank, query="Where did Alice move to?")
+    assert exc.value.status >= 500
+
+
+async def test_with_the_fallback_the_reranker_ranks_it(decision_model_fallback_client, bank, stubs):
+    """With the fallback on, the same recall is ranked by the configured reranker and treated
+    as any reranker's ranking: relevance order rather than the scripted verdicts, with the
+    reranker's score published."""
+    stubs.rerank.fail_with_status = 400
+    stubs.rerank.verdicts = {CELLO: 0.9, STALE: 0.7, CURRENT: 0.5, BERLIN: 0.3}
+
+    response = await decision_model_fallback_client.arecall(bank_id=bank, query="Where did Alice move to?")
+
+    texts = _texts(response)
+    assert texts[:2] == [BERLIN, CELLO]
+    # The two deadlines score the same with the reranker; recency alone orders them.
+    assert set(texts[2:]) == {STALE, CURRENT}
+    scores = [result.scores for result in response.results]
+    assert [score.reranker for score in scores] == pytest.approx(
+        [0.5374011537017761, 0.29814239699997197, 0.1673320053068151, 0.1673320053068151], abs=1e-9
+    )
+    # The boosts a reranker's scores get are applied: the final score is not the reranker's.
+    assert scores[0].final == pytest.approx(0.5911412641214727, abs=1e-6)

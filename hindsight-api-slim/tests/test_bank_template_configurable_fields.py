@@ -25,7 +25,7 @@ import pytest
 import pytest_asyncio
 
 from hindsight_api.api import create_app
-from hindsight_api.api.http import BankTemplateConfig
+from hindsight_api.engine.bank_templates import BankTemplateConfig
 
 # Each tuple is (field_name, applied_value). Values chosen to differ
 # visibly from defaults so round-trip bugs surface.
@@ -41,7 +41,7 @@ NEW_FIELDS: list[tuple[str, object]] = [
     ("max_observations_per_scope", 13),
     ("reflect_source_facts_max_tokens", 4096),
     ("mental_model_min_refresh_interval_seconds", 900),
-    ("knowledge_page_default_trigger", {"refresh_cron": "0 * * * *", "mode": "full"}),
+    ("page_default_trigger", {"refresh_cron": "0 * * * *", "mode": "full"}),
     ("llm_gemini_safety_settings", [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}]),
     ("recall_budget_function", "adaptive"),
     ("recall_budget_fixed_low", 50),
@@ -54,6 +54,7 @@ NEW_FIELDS: list[tuple[str, object]] = [
     ("recall_budget_max", 1500),
     ("audit_log_enabled", True),
     ("store_document_text", False),
+    ("default_timezone", "Asia/Shanghai"),
 ]
 
 

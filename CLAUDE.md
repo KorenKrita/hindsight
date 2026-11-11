@@ -73,7 +73,8 @@ cd hindsight-system-tests && uv run pytest tests/ -v
 
 ### Documentation Site (Docusaurus)
 ```bash
-./scripts/dev/start-docs.sh
+./scripts/dev/start-docs.sh          # pages compile on first visit (~1 GB)
+./scripts/dev/start-docs.sh --full   # compile every page up front, like the build (~3.5 GB)
 ```
 
 
@@ -151,7 +152,7 @@ Main operations:
 - **Retain**: Store memories, extracts facts/entities/relationships, supports document chunking
 - **Recall**: Retrieve memories via 4 parallel strategies (semantic, BM25, graph, temporal) + reranking
 - **Reflect**: Disposition-aware reasoning using memories and mental models
-- **Knowledge Base**: Tree of auto-refreshing synthetic documents (mental models) synthesized by LLM from bank observations; searchable, exportable as markdown, and mountable read-only to the filesystem via hindsight-cli (`hindsight fs mount`)
+- **Pages**: Tree of auto-refreshing synthetic documents (mental models) synthesized by LLM from bank observations; searchable, exportable as markdown, and mountable read-only to the filesystem via hindsight-cli (`hindsight fs mount`)
 - **Directives & Mental Models**: Manage behavioral guidelines (Directives) and consolidated facts (Mental Models)
 
 ### Database
@@ -251,7 +252,8 @@ migration file dispatches through `run_for_dialect`, which calls either
 
 **Always run the lint script after making Python or TypeScript/Node changes:**
 ```bash
-./scripts/hooks/lint.sh
+./scripts/hooks/lint.sh            # packages that differ from origin/main
+LINT_ALL=1 ./scripts/hooks/lint.sh # everything, as CI does
 ```
 
 Dead-code detection runs in CI (the `check-unused-code` job) at two levels:

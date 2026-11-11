@@ -12,8 +12,8 @@ import asyncpg
 import pytest
 
 from hindsight_api.engine.db import DatabaseBackend, DatabaseConnection, create_database_backend
-from hindsight_api.engine.db.ops import UpdatedWindow
 from hindsight_api.engine.db import postgresql as pg_backend
+from hindsight_api.engine.db.ops import UpdatedWindow
 from hindsight_api.engine.db.postgresql import PostgreSQLBackend, apply_session_settings
 from hindsight_api.engine.db.result import DictResultRow as ResultRow
 from hindsight_api.engine.sql import SQLDialect, create_sql_dialect
@@ -225,6 +225,8 @@ class TestPostgreSQLDialect:
         assert "to_tsquery" in arm
         assert "'bm25' AS source" in arm
         assert "LIMIT $3" in arm
+        # Ties at the LIMIT cut break on id, so repeated recalls keep the same rows (#6056)
+        assert "ORDER BY ts_rank_cd(search_vector, to_tsquery('english', $4)) DESC, id LIMIT $3" in arm
         # Default language is english when bm25_language is not specified
         assert "to_tsquery('english', $4)" in arm
 
@@ -271,7 +273,8 @@ class TestPostgreSQLDialect:
             text_search_extension="vchord",
         )
         assert (
-            "-(search_vector <&> to_bm25query('idx_memory_units_text_search', tokenize($4, 'llmlingua2'))) > 0" in arm
+            "-(search_vector <&> (SELECT to_bm25query('idx_memory_units_text_search', tokenize($4, 'llmlingua2')))) > 0"
+            in arm
         )
 
     def test_build_bm25_arm_vchord_honors_custom_min_score(self, d):
@@ -568,7 +571,7 @@ class TestOracleQueryRewriter:
         assert ":2" in query2
 
     def test_left_becomes_dbms_lob_substr(self):
-        # LEFT() does not exist in Oracle (ORA-00904); knowledge-page snippets use it.
+        # LEFT() does not exist in Oracle (ORA-00904); the rewrite keeps PG-style SQL portable.
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
         query, _, _ = _rewrite_pg_to_oracle("SELECT LEFT(mm.content, 280) AS snippet FROM t LEFT JOIN u ON 1=1")
@@ -1399,7 +1402,7 @@ class TestOracleSetSessionSchema:
         like oracledb: this test fails (TypeError) against the buggy code and
         passes once the erroneous await is removed.
         """
-        from hindsight_api.engine import memory_engine
+        from hindsight_api import schema_context
         from hindsight_api.engine.db.oracle import OracleBackend
 
         executed: list[str] = []
@@ -1421,11 +1424,11 @@ class TestOracleSetSessionSchema:
                 return _FakeAsyncCursor()
 
         backend = OracleBackend()
-        token = memory_engine._current_schema.set("TENANT_X")
+        token = schema_context._current_schema.set("TENANT_X")
         try:
             await backend._set_session_schema(_FakeConn())
         finally:
-            memory_engine._current_schema.reset(token)
+            schema_context._current_schema.reset(token)
 
         assert closed["count"] == 1
         assert any('ALTER SESSION SET CURRENT_SCHEMA = "TENANT_X"' in s for s in executed)
@@ -1440,7 +1443,7 @@ class TestOracleSetSessionSchema:
         reset applies ``ALTER SESSION SET CURRENT_SCHEMA`` to the cached SESSION_USER,
         and the synchronous ``cursor.close()`` is not awaited.
         """
-        from hindsight_api.engine import memory_engine
+        from hindsight_api import schema_context
         from hindsight_api.engine.db.oracle import OracleBackend
 
         executed: list[str] = []
@@ -1461,11 +1464,11 @@ class TestOracleSetSessionSchema:
                 return _FakeAsyncCursor()
 
         backend = OracleBackend()
-        token = memory_engine._current_schema.set("public")
+        token = schema_context._current_schema.set("public")
         try:
             await backend._set_session_schema(_FakeConn())
         finally:
-            memory_engine._current_schema.reset(token)
+            schema_context._current_schema.reset(token)
 
         assert closed["count"] == 1
         assert any('ALTER SESSION SET CURRENT_SCHEMA = "APP_USER"' in s for s in executed)

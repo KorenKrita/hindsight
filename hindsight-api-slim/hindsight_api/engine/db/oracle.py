@@ -23,6 +23,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, NamedTuple, cast
 
+from ...schema_context import get_current_schema
 from .pool_instrumentation import PoolStats, acquire_conn
 
 
@@ -788,7 +789,13 @@ class OracleConnection(DatabaseConnection):
         return "oracle"
 
     def __init__(self, conn: Any) -> None:
+        super().__init__()
         self._conn = conn
+
+    def _commit_is_ahead(self) -> bool:
+        # oracledb runs every statement in a transaction the backend commits when
+        # the acquire()/transaction() block that made this wrapper closes.
+        return True
 
     # -- helpers ----------------------------------------------------------
 
@@ -1496,9 +1503,6 @@ class OracleBackend(DatabaseBackend):
         of PostgreSQL's SET search_path — fq_table() returns bare table names
         for Oracle, relying on this session-level setting for isolation.
         """
-        # Lazy import to avoid circular dependency (memory_engine → db → memory_engine).
-        from ..memory_engine import get_current_schema
-
         schema = get_current_schema()
         cursor = conn.cursor()
         try:
@@ -1537,7 +1541,9 @@ class OracleBackend(DatabaseBackend):
         )
         try:
             await self._set_session_schema(conn)
-            yield OracleConnection(conn)
+            wrapper = OracleConnection(conn)
+            yield wrapper
+            await wrapper._run_before_commit()
             # Auto-commit on clean exit (asyncpg uses autocommit by default;
             # oracledb does not, so we must commit explicitly)
             await conn.commit()
@@ -1555,7 +1561,9 @@ class OracleBackend(DatabaseBackend):
         )
         try:
             await self._set_session_schema(conn)
-            yield OracleConnection(conn)
+            wrapper = OracleConnection(conn)
+            yield wrapper
+            await wrapper._run_before_commit()
             await conn.commit()
         except Exception:
             await conn.rollback()

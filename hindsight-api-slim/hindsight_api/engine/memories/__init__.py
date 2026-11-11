@@ -21,12 +21,15 @@ from .base import (
     DeletePredicate,
     FactRecord,
     FullRecallRequest,
-    KnowledgePageEntry,
-    KnowledgePageMatch,
-    KnowledgePageRef,
+    KnowledgePageEntry,  # deprecated alias, remove in 2.x
+    KnowledgePageMatch,  # deprecated alias, remove in 2.x
+    KnowledgePageRef,  # deprecated alias, remove in 2.x
     MemoriesExtension,
     MemoryPatch,
     MemoryScopeWatermark,
+    PageEntry,
+    PageMatch,
+    PageRef,
     RecallArms,
     ScanPage,
     StoredMemory,
@@ -49,15 +52,18 @@ _memories: MemoriesExtension | None = None
 def create_memories(context=None) -> MemoriesExtension:
     """Build the configured memories store, or the Postgres default."""
     from ...extensions.loader import load_extension
+    from ...operation_runs import time_store_calls
 
+    # Every call into the store is timed against the operation run in progress (see
+    # operation_runs): that is how a run reports its time in the store, whichever store it is.
     loaded = load_extension("MEMORIES", MemoriesExtension, context=context)
     if loaded is not None:
         logger.info("[memories] store=%s (memory rows do not go to postgres)", loaded.name)
-        return loaded
+        return time_store_calls(loaded)
 
     from .postgres import PostgresMemories
 
-    return PostgresMemories({})
+    return time_store_calls(PostgresMemories({}))
 
 
 def get_memories() -> MemoriesExtension:
@@ -148,9 +154,12 @@ __all__ = [
     "CausalEdgeRecord",
     "DeletePredicate",
     "FactRecord",
-    "KnowledgePageEntry",
-    "KnowledgePageMatch",
-    "KnowledgePageRef",
+    "KnowledgePageEntry",  # deprecated alias, remove in 2.x
+    "KnowledgePageMatch",  # deprecated alias, remove in 2.x
+    "KnowledgePageRef",  # deprecated alias, remove in 2.x
+    "PageEntry",
+    "PageMatch",
+    "PageRef",
     "MemoriesExtension",
     "MemoryPatch",
     "MemoryScopeWatermark",

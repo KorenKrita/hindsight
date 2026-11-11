@@ -3,7 +3,10 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EventEmitter } from "node:events";
 import { buildSessionStartContext, runSessionStartHook } from "./session-start";
+import { startCodebaseSurvey, SURVEY_MAX_ATTEMPTS } from "./survey";
+import { releaseLease, SURVEY_SPEC_ENV } from "./survey-lease";
 import { resolveConfig } from "./config";
 import { repoNameOf } from "./git";
 import { HOOK_HARNESSES } from "../harness/hook-lifecycle";
@@ -89,8 +92,8 @@ describe("buildSessionStartContext", () => {
     // The learning note is USER-VISIBLE (systemMessage), not buried in model context.
     expect(out.systemMessage).toContain("is learning");
     expect(out.systemMessage).toContain("bank-1");
-    // The knowledge preamble is model context, lists live pages, and drops the old static mission.
-    expect(out.additionalContext).toContain("<hindsight_knowledge>");
+    // The pages preamble is model context, lists live pages, and drops the old static mission.
+    expect(out.additionalContext).toContain("<hindsight_pages>");
     expect(out.additionalContext).toContain("deliberately NOT listed here");
     expect(out.additionalContext).not.toContain("agent_knowledge_list_pages");
     // The banner must NOT be duplicated into model context. (The tool guide legitimately
@@ -402,8 +405,8 @@ describe("buildSessionStartContext", () => {
     // Seeding is unaffected by a listPages failure.
     expect(startSeed).toHaveBeenCalledWith("/repo/dir", { limit: 300, harness: "claude-code" });
     // Empty-state roster preamble still renders (no page names, no throw).
-    expect(out.additionalContext).toContain("<hindsight_knowledge>");
-    expect(out.additionalContext).toContain("No knowledge pages yet");
+    expect(out.additionalContext).toContain("<hindsight_pages>");
+    expect(out.additionalContext).toContain("No pages yet");
     expect(out.additionalContext).not.toContain("(p1)");
     // The background-learning note is still user-visible.
     expect(out.systemMessage).toContain("is learning");
@@ -707,6 +710,58 @@ describe("buildSessionStartContext — crashed-survey retry (baseline without fi
     });
     expect(startSurvey).toHaveBeenCalledTimes(1);
     expect(out).toBeTruthy();
+  });
+});
+
+describe("buildSessionStartContext — survey attempt limit (#5623)", () => {
+  // The outage that loops the survey is the server's extraction failing, which drops every write
+  // this hook makes — so the count must hold with every retain failing.
+  it("stops surveying a commit after SURVEY_MAX_ATTEMPTS launches, with every retain failing", async () => {
+    const leaseDir = mkdtempSync(join(tmpdir(), "hindsight-attempts-"));
+    try {
+      const spawn = vi.fn().mockImplementation(() => {
+        const child = Object.assign(new EventEmitter(), { unref: vi.fn() });
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      });
+      const startSurvey: typeof startCodebaseSurvey = async (repo, opts) => {
+        const started = await startCodebaseSurvey(repo, {
+          ...opts,
+          spawn,
+          resolveBin: (b) => b,
+          supervisorPath: "/x/survey-supervisor.js",
+          lease: { dir: leaseDir },
+        });
+        // What the supervisor does once the failed agent exits.
+        if (started) releaseLease(JSON.parse(spawn.mock.lastCall![2].env[SURVEY_SPEC_ENV]).lease);
+        return started;
+      };
+      const session = () =>
+        buildSessionStartContext({
+          cwd: "/tmp/x",
+          bankId: "bank-1",
+          cfg: resolveConfig({ surveyRefreshCommits: 50 }),
+          client: {
+            listDocumentIds: async (tag: string) =>
+              tag === "source:survey-baseline"
+                ? new Set(["survey-baseline:aaa"])
+                : tag === "source:upload"
+                  ? new Set<string>() // the findings never landed
+                  : new Set(["git:abc"]),
+            listPages: async () => ({ items: [] }),
+            retain: vi.fn().mockRejectedValue(new Error("budget_exceeded")),
+          },
+          hasGit: () => true,
+          startSeed: vi.fn(),
+          startSurvey,
+          headSha: () => "bbb",
+          commitsSince: () => 1,
+        });
+      for (let i = 0; i < SURVEY_MAX_ATTEMPTS + 2; i++) await session();
+      expect(spawn).toHaveBeenCalledTimes(SURVEY_MAX_ATTEMPTS);
+    } finally {
+      rmSync(leaseDir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -13,6 +13,7 @@ Tests cover:
 import asyncio
 import json
 import os
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -238,7 +239,7 @@ class TestWorkerOperationMetrics:
         collector.record_operation_result.assert_called_once()
         call = collector.record_operation_result.call_args
         assert call.args[0] == "retain"  # batch_retain normalised
-        assert call.kwargs["success"] is True
+        assert call.kwargs["outcome"] == "true"
         assert call.kwargs["source"] == "worker"
 
     @pytest.mark.asyncio
@@ -260,7 +261,7 @@ class TestWorkerOperationMetrics:
 
         collector = await self._run(boom)
         collector.record_operation_result.assert_called_once()
-        assert collector.record_operation_result.call_args.kwargs["success"] is False
+        assert collector.record_operation_result.call_args.kwargs["outcome"] == "false"
 
     @pytest.mark.asyncio
     async def test_deferral_not_counted(self):
@@ -545,6 +546,8 @@ class TestWorkerPoller:
         for task in my_claims:
             assert task.operation_id is not None
             assert task.task_dict is not None
+            # When it was queued: the operation runs it executes report their wait from it.
+            assert task.queued_at is not None and task.queued_at.tzinfo is not None
 
         # Verify tasks are marked as processing with worker_id
         rows = await pool.fetch(
@@ -554,6 +557,28 @@ class TestWorkerPoller:
         for row in rows:
             assert row["status"] == "processing"
             assert row["worker_id"] == "test-worker-1"
+
+        # Runs opened by the executor carry the task's id and queue time.
+        from hindsight_api import operation_runs
+
+        runs = []
+        operation_runs.set_sink(runs.append)
+
+        async def run_one(task_dict):
+            with operation_runs.timed_operation("retain", bank_id):
+                pass
+
+        poller._executor = run_one
+        try:
+            await poller.execute_task(my_claims[0])  # runs in the background
+            for _ in range(100):
+                if runs:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            operation_runs.set_sink(None)
+        [run] = runs
+        assert run.task_id == my_claims[0].operation_id and run.queued_at == my_claims[0].queued_at
 
     @pytest.mark.asyncio
     async def test_claim_batch_cannot_see_rows_outside_this_files_schema(self, pool, clean_operations):
@@ -1228,6 +1253,7 @@ class TestWorkerPoller:
         from datetime import UTC, datetime, timedelta
 
         from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
+        from hindsight_api.models import RequestContext
         from hindsight_api.worker.exceptions import DeferOperation, RetryTaskAt
 
         retry_at = (datetime.now(UTC) + timedelta(hours=5)).replace(microsecond=0)
@@ -1236,12 +1262,15 @@ class TestWorkerPoller:
             raise ProviderRateLimitResetError(retry_at=retry_at, message="quota resets later")
 
         monkeypatch.setattr(memory, "_handle_batch_retain", quota_limited_retain)
+        # A retain job only runs for a bank that exists: one for a missing bank is skipped (#6344).
+        bank_id = f"test-provider-quota-defer-{uuid.uuid4().hex[:8]}"
+        await memory.ensure_bank_profile(bank_id, request_context=RequestContext(internal=True))
 
         with pytest.raises(DeferOperation) as exc_info:
             await memory.execute_task(
                 {
                     "type": "batch_retain",
-                    "bank_id": "test-provider-quota-defer",
+                    "bank_id": bank_id,
                     "contents": [{"content": "x"}],
                 }
             )
@@ -2397,6 +2426,42 @@ class TestTaskReleaseOnStop:
         assert row["retry_count"] == 0, "a completed task must not be charged a retry"
 
     @pytest.mark.asyncio
+    async def test_drain_budget_counts_from_begin_shutdown(self, pool, backend, clean_operations):
+        """The drain clock starts at the signal, not when the teardown gets round to it (#6021).
+
+        In the API, uvicorn drains HTTP before the lifespan teardown calls shutdown_graceful;
+        that time must come out of the drain budget, or release lands after the grace period.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        op_id = await self._insert_pending(pool, bank_id)
+
+        started = asyncio.Event()
+
+        async def never_ending_executor(task_dict):
+            started.set()
+            await asyncio.Event().wait()
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=never_ending_executor)
+        task = await self._claim_ours(poller, op_id)
+        await poller.execute_task(task)
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        poller.begin_shutdown()
+        assert poller.is_shutdown, "the signal must stop intake at once"
+        await asyncio.sleep(2.0)  # the HTTP drain, already as long as the budget below
+
+        t0 = time.monotonic()
+        await poller.shutdown_graceful(timeout=2.0)
+        assert time.monotonic() - t0 < 1.5, "the drain must not restart its clock at teardown"
+
+        row = await pool.fetchrow("SELECT status, worker_id FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "pending"
+        assert row["worker_id"] is None
+
+    @pytest.mark.asyncio
     async def test_shutdown_does_not_touch_other_workers(self, pool, backend, clean_operations):
         """The release is scoped to this worker's own rows."""
         from hindsight_api.worker import WorkerPoller
@@ -2422,6 +2487,54 @@ class TestTaskReleaseOnStop:
         )
         assert row["status"] == "processing", "another live worker's row must be left alone"
         assert row["worker_id"] == "other-worker"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_release_visits_only_schemas_it_claimed_in(self, pool, backend, clean_operations):
+        """With many tenant schemas, shutdown must not walk them all.
+
+        One reclaim per schema across thousands of tenants outlasts a typical
+        termination grace period, so the process is killed before the release
+        (and the rest of the teardown) finishes. The worker can only own rows
+        where it claimed, so those schemas are the only ones it visits.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        op_id = await self._insert_pending(pool, bank_id)
+
+        started = asyncio.Event()
+        block = asyncio.Event()
+
+        async def blocking_executor(task_dict):
+            started.set()
+            await block.wait()
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=blocking_executor)
+        task = await self._claim_ours(poller, op_id)
+        await poller.execute_task(task)
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        # From here on the deployment has thousands of tenants.
+        async def many_schemas():
+            return [None] + [f"tenant_{i}" for i in range(5000)]
+
+        poller._get_schemas = many_schemas
+        visited: list[str | None] = []
+        real_reclaim = poller._reclaim_own_processing_tasks
+
+        async def spy_reclaim(schema, **kwargs):
+            visited.append(schema)
+            return await real_reclaim(schema, **kwargs)
+
+        poller._reclaim_own_processing_tasks = spy_reclaim
+
+        await poller.shutdown_graceful(timeout=0.1)
+
+        assert visited == [task.schema], "shutdown must visit only the schemas this worker claimed in"
+        row = await pool.fetchrow("SELECT status, worker_id FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "pending", "the claimed row must still be handed back"
+        assert row["worker_id"] is None
 
     @pytest.mark.asyncio
     async def test_failed_terminal_write_is_retried_until_it_lands(self, pool, backend, clean_operations):
@@ -5721,7 +5834,7 @@ class TestTerminalOperationRetention:
     @pytest.mark.asyncio
     async def test_oracle_backend_resets_default_schema_on_pooled_connection(self):
         from hindsight_api.engine.db.oracle import OracleBackend
-        from hindsight_api.engine.memory_engine import _current_schema
+        from hindsight_api.schema_context import _current_schema
 
         backend = OracleBackend()
         backend._default_schema = "APP_USER"
@@ -5749,7 +5862,7 @@ class TestTerminalOperationRetention:
     @pytest.mark.asyncio
     async def test_oracle_backend_discovers_session_user_before_first_schema_switch(self):
         from hindsight_api.engine.db.oracle import OracleBackend
-        from hindsight_api.engine.memory_engine import _current_schema
+        from hindsight_api.schema_context import _current_schema
 
         backend = OracleBackend()
         cursor = MagicMock()
@@ -5956,3 +6069,24 @@ async def test_finished_task_wakes_the_idle_poll_at_once():
 
     poller._shutdown.set()
     await asyncio.wait_for(polling, timeout=1)
+
+
+def test_sigterm_stops_poller_intake_then_runs_previous_handler():
+    """The API's SIGTERM stops the embedded poller's claims before uvicorn's own drain (#6021)."""
+    import signal
+
+    from hindsight_api.api.http import _stop_claiming_on_sigterm
+
+    server_calls: list[int] = []
+    original = signal.signal(signal.SIGTERM, lambda signum, frame: server_calls.append(signum))
+    loop = asyncio.new_event_loop()
+    try:
+        poller = MagicMock()
+        _stop_claiming_on_sigterm(poller, loop)
+        signal.raise_signal(signal.SIGTERM)
+        loop.run_until_complete(asyncio.sleep(0))
+        poller.begin_shutdown.assert_called_once_with()
+        assert server_calls == [signal.SIGTERM], "uvicorn's handler must still run"
+    finally:
+        signal.signal(signal.SIGTERM, original)
+        loop.close()

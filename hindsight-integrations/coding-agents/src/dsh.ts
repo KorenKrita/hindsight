@@ -10,7 +10,7 @@
  *   agent/session-start  -> RuntimeCore.seedIfCold      (cold-check + background git/codebase seed)
  *   agent/pre-step       -> RuntimeCore.onPrompt        (recall) + the injection as a sourced message
  *   agent/turn-stopping  -> RuntimeCore.onSessionIdle   (write-back of the completed exchange)
- *   ctx.tools            -> the hindsight_* knowledge suite, registered natively
+ *   ctx.tools            -> the hindsight_* page suite, registered natively
  *
  * ONE dsh PROCESS SERVES MANY WORKSPACES. Unlike opencode/Kilo/Cline — one process, one project —
  * dsh's Web UI creates sessions in whatever directory the user picks, each with its own
@@ -25,7 +25,7 @@
 import { randomUUID } from "node:crypto";
 import { resolveHostMemory } from "./core/host-client";
 import { diag } from "./core/diag";
-import type { ToolSpec } from "./core/knowledge-tools";
+import type { ToolSpec } from "./core/page-tools";
 import { log } from "./core/log";
 import { RuntimeCore } from "./core/runtime";
 import { HINDSIGHT_PLUGIN, readDshEvents, type DshSessionEvent } from "./core/transcript-dsh";
@@ -49,6 +49,9 @@ interface DshSession {
   readonly events?: readonly DshSessionEvent[];
   /** Public accessor on DeepSeek Harness alpha.4+ (replaces the removed `events` property). */
   snapshotEvents?(): readonly DshSessionEvent[];
+  /** How many leading events a FORK copied from its parent (`session/fork`); 0 or absent otherwise.
+   *  Persisted with the session, so it survives a restart. */
+  readonly inheritedEventCount?: number;
 }
 
 interface DshAgent {
@@ -141,6 +144,19 @@ export function dshSessionEvents(
   return session.snapshotEvents?.() ?? session.events ?? [];
 }
 
+/**
+ * The events this session produced itself — what its write-back saves. A fork saves only its new
+ * turns (#5940): the prefix it inherited is the parent's conversation, which the parent already
+ * stores, and the child's first write-back used to send all of it again under its own document,
+ * re-extracting history the bank already held. The full log is still what the model sees, so
+ * everything else (the injection dedupe below) reads `dshSessionEvents`.
+ */
+export function ownEvents(
+  session: Pick<DshSession, "snapshotEvents" | "events" | "inheritedEventCount">
+): readonly DshSessionEvent[] {
+  return dshSessionEvents(session).slice(session.inheritedEventCount ?? 0);
+}
+
 /** Where a session is working. dsh records it on the session header; a session without one is rare. */
 function workspaceRoot(agent: DshAgent): string {
   return agent.session.header.cwd || process.cwd();
@@ -166,15 +182,14 @@ function workspaceFor(root: string): Workspace | undefined {
     return undefined;
   }
   // The 5th argument is this host's whole reason for existing here: RuntimeCore binds the
-  // knowledge tools (and retain stamps) to the workspace it is given, and dsh's process cwd is the
+  // page tools (and retain stamps) to the workspace it is given, and dsh's process cwd is the
   // launch directory, routinely a different repository from the session's.
   const core = new RuntimeCore(client, bankId, cfg, HARNESS, root);
   // The write-back path reads the log back off the live agent — dsh keeps the whole session in
   // memory, so unlike opencode there is nothing to refetch over HTTP.
   core.setTranscriptSource(async (sessionId) => {
     const agent = liveAgents.get(sessionId);
-    // alpha.4+ removed Session.events; snapshotEvents() is the public accessor.
-    return agent ? readDshEvents(dshSessionEvents(agent.session)) : [];
+    return agent ? readDshEvents(ownEvents(agent.session)) : [];
   });
   const workspace: Workspace = { core, root };
   workspaces.set(root, workspace);
@@ -186,7 +201,7 @@ function workspaceFor(root: string): Workspace | undefined {
  *
  * Fire-and-forget by design: `agent/session-start` is an emit that no extension point awaits, and
  * the Web UI must not wait on a network round-trip to open a session. Nothing the first prompt
- * needs comes from here — it builds its own knowledge preamble from that session's page list.
+ * needs comes from here — it builds its own pages preamble from that session's page list.
  */
 function ensureSeeded(workspace: Workspace): void {
   workspace.seeded ??= workspace.core.seedIfCold(workspace.root);
@@ -237,6 +252,26 @@ function injectionMessage(text: string): DshUserMessage {
   };
 }
 
+/**
+ * The text of the last memory block this session's history carries, if any.
+ *
+ * dsh keeps every injected message in the history it sends, so re-appending an unchanged block (the
+ * per-turn roster) only stacks identical copies (#5026). This used to be remembered in a map keyed
+ * by session id, which a fork (new id, inherited history) and a restart (empty map) both reset while
+ * the block was still in the history — so the next unchanged recall appended a second copy (#5940).
+ * Reading it off the history itself is what the model will actually see.
+ */
+export function lastInjectedText(events: readonly DshSessionEvent[]): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event?.type !== "user/message") continue;
+    const message = event.data as Partial<DshUserMessage> | undefined;
+    if (message?.source?.kind !== `plugin:${HINDSIGHT_PLUGIN}`) continue;
+    return (message.content ?? []).map((block) => block.text ?? "").join("\n");
+  }
+  return undefined;
+}
+
 // ── the lifecycle, testable without a dsh host ──────────────────────────────────
 
 /**
@@ -244,9 +279,6 @@ function injectionMessage(text: string): DshUserMessage {
  * real Cordis events; the tests drive them with a stand-in agent and core.
  */
 export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefined) {
-  // sessionId -> the block last appended. dsh keeps every injected message in the history it sends,
-  // so re-appending an unchanged block (the per-turn roster) only stacks identical copies (#5026).
-  const lastInjected = new Map<string, string>();
   return {
     sessionStart({ agent }: { agent: DshAgent }): void {
       const workspace = resolve(agent);
@@ -278,11 +310,10 @@ export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefin
         diag(HARNESS, "inject_empty", { session: sessionId });
         return decision;
       }
-      if (injection === lastInjected.get(sessionId)) {
+      if (injection === lastInjectedText(dshSessionEvents(agent.session))) {
         diag(HARNESS, "inject_unchanged", { session: sessionId });
         return decision;
       }
-      lastInjected.set(sessionId, injection);
       diag(HARNESS, "inject_ok", { session: sessionId, chars: injection.length });
       return { kind: "enter", messages: [...decision.messages, injectionMessage(injection)] };
     },
@@ -299,7 +330,6 @@ export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefin
 
     disposed({ agent }: { agent: DshAgent }): void {
       liveAgents.delete(agent.session.header.id);
-      lastInjected.delete(agent.session.header.id);
     },
   };
 }

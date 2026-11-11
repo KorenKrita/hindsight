@@ -321,6 +321,48 @@ def split_markdown(markdown: str) -> StructuredDocument:
     return StructuredDocument(sections=sections)
 
 
+def promote_embedded_headings(doc: StructuredDocument, reserved_ids: set[str]) -> StructuredDocument:
+    """Turn a heading written inside a block into the section a reader sees.
+
+    A model sometimes writes a heading into block text (``"### History\\n\\n- …"``).
+    Stored as one block, the structure says it belongs to the section it was
+    added to, while the render — and every reader of it — shows a new section
+    from that heading on. The next edit to the old section then lands visually
+    under the embedded heading (#6379). Splitting here keeps the structure equal
+    to ``split_markdown(render_document(doc))`` at section level: the heading
+    opens a real section, and the blocks after it move under it, as they render.
+
+    Blocks without a heading keep their id. New blocks get ids not already in
+    ``reserved_ids``, which is updated in place.
+    """
+    if not any(_has_heading(b.text) for s in doc.sections for b in s.blocks):
+        return doc
+    used_section_ids = {s.id for s in doc.sections}
+    sections: list[Section] = []
+    for section in doc.sections:
+        current = section.model_copy(update={"blocks": []})
+        sections.append(current)
+        for block in section.blocks:
+            if not _has_heading(block.text):
+                current.blocks.append(block)
+                continue
+            for part in split_markdown(block.text).sections:
+                if part.heading:
+                    section_id = make_unique_id(part.id, used_section_ids)
+                    used_section_ids.add(section_id)
+                    current = Section(id=section_id, heading=part.heading, level=part.level)
+                    sections.append(current)
+                for piece in part.blocks:
+                    block_id = make_block_id(piece.text, reserved_ids)
+                    reserved_ids.add(block_id)
+                    current.blocks.append(Block(id=block_id, text=piece.text))
+    return doc.model_copy(update={"sections": sections})
+
+
+def _has_heading(text: str) -> bool:
+    return any(s.heading for s in split_markdown(text).sections)
+
+
 class DocumentSectionsInvalidError(ValueError):
     """The ``done`` tool's ``document`` argument did not match the declared shape.
 
@@ -354,6 +396,9 @@ def document_from_sections(payload: dict) -> StructuredDocument:
     blank-line-separated fragments is split into one block each, so the document
     keeps the granularity delta operations address even when the model packs a
     whole section into one string.
+
+    The same goes for ``blocks`` sent as one string instead of an array of them:
+    it is the section's single block, as the brackets would have made it.
 
     A *type* violation is refused instead: a block that is not a string, or a
     section that is not an object, raises :class:`DocumentSectionsInvalidError`
@@ -394,6 +439,12 @@ def document_from_sections(payload: dict) -> StructuredDocument:
             )
             continue
         raw_blocks = raw_section.get("blocks") or []
+        if isinstance(raw_blocks, str):
+            # The list's brackets dropped around its one entry -- seen most on a section that is
+            # a single markdown list. One reading, nothing lost: it is that block, split below
+            # like any block holding several fragments.
+            raw_blocks = [raw_blocks]
+            raw_section = {**raw_section, "blocks": raw_blocks}
         if not isinstance(raw_blocks, list):
             errors.append(f"sections[{i}].blocks: expected an array of strings, got {type(raw_blocks).__name__}")
             continue
@@ -436,7 +487,7 @@ def document_from_sections(payload: dict) -> StructuredDocument:
         used_ids.add(section_id)
         sections.append(Section(id=section_id, heading=heading, level=level, blocks=blocks))
 
-    return StructuredDocument(sections=sections)
+    return promote_embedded_headings(StructuredDocument(sections=sections), block_ids)
 
 
 class CanonicalDocument(BaseModel):

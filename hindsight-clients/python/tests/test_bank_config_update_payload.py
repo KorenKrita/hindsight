@@ -271,15 +271,17 @@ def test_update_bank_config_forwards_the_full_configurable_surface(monkeypatch):
         consolidation_llm_parallelism=2,
         consolidation_max_memories_per_round=50,
         mental_model_min_refresh_interval_seconds=3600,
-        knowledge_page_default_trigger={"refresh_cron": "0 * * * *"},
+        page_default_trigger={"refresh_cron": "0 * * * *"},
         max_observations_per_scope=25,
         observation_scope_limits=[{"scope": "team", "limit": 10}],
         consolidation_strategies=[{"scopes": [{"tags": ["company:*"]}], "observations_mission": "Trends only."}],
         default_observation_scopes=[["topic:*", "user:*"]],
         retain_chunk_batch_size=64,
         store_document_text=False,
+        default_timezone="Asia/Shanghai",
         memory_defense={"redact_secrets": True},
         audit_log_enabled=True,
+        knowledge_banks=["product-docs"],
     )
 
     assert captured["updates"] == {
@@ -301,15 +303,17 @@ def test_update_bank_config_forwards_the_full_configurable_surface(monkeypatch):
         "consolidation_llm_parallelism": 2,
         "consolidation_max_memories_per_round": 50,
         "mental_model_min_refresh_interval_seconds": 3600,
-        "knowledge_page_default_trigger": {"refresh_cron": "0 * * * *"},
+        "page_default_trigger": {"refresh_cron": "0 * * * *"},
         "max_observations_per_scope": 25,
         "observation_scope_limits": [{"scope": "team", "limit": 10}],
         "consolidation_strategies": [{"scopes": [{"tags": ["company:*"]}], "observations_mission": "Trends only."}],
         "default_observation_scopes": [["topic:*", "user:*"]],
         "retain_chunk_batch_size": 64,
         "store_document_text": False,
+        "default_timezone": "Asia/Shanghai",
         "memory_defense": {"redact_secrets": True},
         "audit_log_enabled": True,
+        "knowledge_banks": ["product-docs"],
     }
 
 

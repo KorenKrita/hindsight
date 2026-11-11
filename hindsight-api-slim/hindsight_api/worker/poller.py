@@ -18,6 +18,7 @@ import signal
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -28,8 +29,10 @@ from ..config import (
     ENV_RETAIN_WALL_TIMEOUT,
     get_config,
 )
+from ..engine.permit_wait import excluding_permit_wait
 from ..engine.schema import fq_table_explicit as fq_table
-from ..metrics import get_metrics_collector
+from ..metrics import OperationOutcome, get_metrics_collector
+from ..operation_runs import worker_task
 from .backpressure import is_append_conflict, is_store_backpressure
 from .exceptions import DeferOperation, RetryTaskAt, format_task_error
 
@@ -94,6 +97,11 @@ class _WallCeiling:
     config_attr: str
     env_var: str
     extends_on_progress: bool = False
+    #: Time spent queued for a shared LLM permit does not count. A refresh is one
+    #: reflect whose calls queue behind every other refresh under a small per-op
+    #: cap; counting the queue cancelled healthy refreshes whenever a burst was
+    #: submitted together, and paused their pages (#6140). Retain stays absolute.
+    excludes_permit_wait: bool = False
 
 
 _WALL_CEILINGS: dict[str, _WallCeiling] = {
@@ -108,7 +116,9 @@ _WALL_CEILINGS: dict[str, _WallCeiling] = {
     ),
     # A refresh is one reflect plus its write, so it shares reflect's budget. Without
     # a ceiling a wedged refresh held its worker slot until restart (#4581).
-    "refresh_mental_model": _WallCeiling(config_attr="reflect_wall_timeout", env_var=ENV_REFLECT_WALL_TIMEOUT),
+    "refresh_mental_model": _WallCeiling(
+        config_attr="reflect_wall_timeout", env_var=ENV_REFLECT_WALL_TIMEOUT, excludes_permit_wait=True
+    ),
 }
 
 
@@ -312,6 +322,8 @@ class ClaimedTask:
     task_dict: dict[str, Any]
     schema: str | None
     folded_operation_ids: list[str] = field(default_factory=list)
+    #: When the task was queued (its row's ``created_at``), for the operation runs it executes.
+    queued_at: datetime | None = None
     """Peers coalesced into this execution (see ``engine.retain.fold``).
 
     They were claimed by the same transaction that claimed ``operation_id`` and
@@ -424,6 +436,9 @@ class WorkerPoller:
 
         self._optional_routines = OptionalRoutines(self._backend)
         self._shutdown = asyncio.Event()
+        # Loop time at which shutdown began: the drain budget counts from here, so a
+        # drain started by a signal overlaps the HTTP server's own drain (#6021).
+        self._shutdown_started_at: float | None = None
         # Set when a task finishes: the idle poll wakes at once to fill the freed slot
         # instead of sleeping out the rest of poll_interval_ms (#5650). A new submit
         # deliberately does NOT wake it: the wait is what lets repeated refresh and
@@ -458,6 +473,10 @@ class WorkerPoller:
         # this worker has never claimed for, so only a range can discover it.
         # Empty string starts a round; claim_tasks resets to it at the end of one.
         self._next_bank_cursor: dict[str | None, str] = {}
+        # Every schema this process has claimed a row in. Shutdown hands back only
+        # what this worker owns, and it can only own rows where it claimed, so
+        # release_own_tasks walks these instead of every tenant schema.
+        self._claimed_schemas: set[str | None] = set()
         # Retention cleanup runs outside the claim loop. Keep one task per
         # poller so maintenance cannot overlap with itself or block slot refill.
 
@@ -767,6 +786,9 @@ class WorkerPoller:
             # picks the bank, so this costs no extra statement to learn.
             self._next_bank_cursor[schema] = claimed.next_bank_cursor
             all_rows = claimed.rows
+            if all_rows:
+                # Before anything below can fail: once claimed, the row is ours to release.
+                self._claimed_schemas.add(schema)
 
             if not all_rows:
                 return []
@@ -790,6 +812,7 @@ class WorkerPoller:
                         task_dict=task_dict,
                         schema=schema,
                         folded_operation_ids=folded,
+                        queued_at=row.get("created_at"),
                     )
                 )
             return result
@@ -1235,7 +1258,8 @@ class WorkerPoller:
 
                     progress_holder.on_progress = _extend_deadline
                 try:
-                    await self._executor(task.task_dict)
+                    with excluding_permit_wait(cm, wall_timeout) if ceiling.excludes_permit_wait else nullcontext():
+                        await self._executor(task.task_dict)
                 finally:
                     if holder is not None:
                         holder.on_progress = None
@@ -1305,7 +1329,8 @@ class WorkerPoller:
             logger.debug(f"Executing task {task.operation_id} (type={task_type}, bank={bank_id}{schema_info})")
             if task.schema:
                 task.task_dict["_schema"] = task.schema
-            await self._run_executor(task, task_type, holder)
+            with worker_task(task.operation_id, task.queued_at):
+                await self._run_executor(task, task_type, holder)
             logger.debug(f"Task {task.operation_id} execution finished")
         except _WallTimeoutExceeded as e:
             # The executor has already been cancelled; all that's left is to say so
@@ -1397,7 +1422,7 @@ class WorkerPoller:
                 metrics.record_operation_result(
                     op_label,
                     bank_id,
-                    success=terminal_success,
+                    outcome=OperationOutcome.SUCCESS if terminal_success else OperationOutcome.FAILURE,
                     duration=time.perf_counter() - op_start,
                     source="worker",
                 )
@@ -1633,20 +1658,20 @@ class WorkerPoller:
         rows claimed before startup and the parent pass re-checks each parent
         under a row lock.
 
+        Only the schemas this process claimed in are visited. With thousands of
+        tenant schemas, a walk over all of them takes longer than a typical
+        termination grace period, and the process is killed partway through —
+        the very stranding this release exists to prevent. Rows a previous run
+        under the same worker id left behind elsewhere are startup recovery's.
+
         Returns:
             Number of operations returned to pending.
         """
         # Nothing here may raise: this runs on the shutdown path, where the DB
         # being unwell is exactly the case that strands rows, and an exception
         # escaping would abort the rest of the teardown.
-        try:
-            schemas = await self._get_schemas()
-        except Exception as e:
-            logger.warning(f"Worker {self._worker_id} could not list schemas to release its in-flight tasks: {e}")
-            return 0
-
         total_count = 0
-        for schema in schemas:
+        for schema in list(self._claimed_schemas):
             try:
                 total_count += await self._reclaim_own_processing_tasks(schema)
             except Exception as e:
@@ -1971,6 +1996,19 @@ class WorkerPoller:
 
         logger.info(f"Worker {self._worker_id} polling loop stopped")
 
+    def begin_shutdown(self) -> float:
+        """Stop claiming new work and start the drain clock. Idempotent.
+
+        Call it the moment the process is told to stop (the API does, from its
+        SIGTERM handler): every claim taken after the signal is work that must
+        then fit into what is left of the platform's grace period (#6021).
+        """
+        if self._shutdown_started_at is None:
+            self._shutdown_started_at = asyncio.get_running_loop().time()
+            logger.info(f"Worker {self._worker_id} stopped claiming new tasks")
+        self._shutdown.set()
+        return self._shutdown_started_at
+
     async def shutdown_graceful(self, timeout: float = 30.0):
         """
         Signal shutdown and wait for current tasks to complete.
@@ -1980,15 +2018,16 @@ class WorkerPoller:
         write that never landed — is handed back to 'pending' before returning.
 
         Args:
-            timeout: Maximum time to wait for in-flight tasks (seconds)
+            timeout: Maximum time to wait for in-flight tasks (seconds), counted
+                from `begin_shutdown` when that ran first.
         """
         logger.info(f"Worker {self._worker_id} initiating graceful shutdown")
-        self._shutdown.set()
+        started_at = self.begin_shutdown()
 
         # Wait for in-flight tasks to complete
         drained = False
-        start_time = asyncio.get_event_loop().time()
-        while asyncio.get_event_loop().time() - start_time < timeout:
+        loop = asyncio.get_running_loop()
+        while loop.time() - started_at < timeout:
             async with self._in_flight_lock:
                 in_flight = self._in_flight_count
                 active_task_objects = [info.bg_task for info in self._active_tasks.values()]

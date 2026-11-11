@@ -10,14 +10,14 @@ from datetime import datetime, timezone
 
 import pytest
 
+from hindsight_api.engine.memories import MemoryScopeWatermark
 from hindsight_api.engine.memory_engine import (
     MemoryEngine,
-    _MentalModelScopeWatermark,
     _mental_model_stale_scope_from_row,
+    _MentalModelScopeWatermark,
 )
-from hindsight_api.engine.schema import fq_store_table
-from hindsight_api.engine.memories import MemoryScopeWatermark
 from hindsight_api.engine.retain import embedding_utils
+from hindsight_api.engine.schema import fq_store_table
 from tests.llm_judge import assert_meets_criteria, evaluate
 
 
@@ -1505,7 +1505,7 @@ class TestMentalModelStaleness:
     async def test_batched_staleness_matches_the_single_model_answer(self, memory: MemoryEngine, request_context):
         """The batched check is the same question, asked once for many models.
 
-        The knowledge tree and the mental-model list read staleness in bulk; the
+        The page tree and the mental-model list read staleness in bulk; the
         single-model read and the refresh gate read it one at a time. They must
         never disagree, so this pins every scope shape the batch handles — flat
         tags in each match mode, a fact-type filter, and the compound tag_groups
@@ -1562,6 +1562,92 @@ class TestMentalModelStaleness:
         assert batched == one_at_a_time
         # Guard against both sides being uniformly wrong together.
         assert set(batched.values()) == {True, False}, batched
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.memory_backend_incompatible
+    @pytest.mark.parametrize("tags_match", ["all_strict", "any"])
+    async def test_pages_sharing_a_filter_each_keep_their_own_cutoff(
+        self, memory: MemoryEngine, request_context, tags_match
+    ):
+        """Pages with the same filter are asked once, but answered per cutoff (#6325).
+
+        The batch looks up the filter's newest write once and compares every page's
+        cutoff against it. Pinned in both query shapes — the tag-index aggregate
+        (``all_strict``) and the time-ordered walk (``any``) — with cutoffs before,
+        at and after that write, tags listed in a different order (still the same
+        filter), and a fact-type filter that must not be folded into the others.
+        """
+        from datetime import timedelta
+
+        from hindsight_api.engine.memories import get_memories
+
+        bank_id = f"test-mm-shared-filter-{uuid.uuid4().hex[:8]}"
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
+        await self._insert_memory(memory, bank_id, tags=["user_a", "team_red"], fact_type="experience")
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            # Read straight from the table, like `_insert_memory` writes to it: the
+            # cutoffs are placed around the store's own `updated_at`, the internal
+            # column the staleness check compares against, and the "at" case needs
+            # it exactly.
+            written = await conn.fetchval(
+                f"SELECT max(updated_at) FROM {fq_store_table('memory_units')} WHERE bank_id = $1", bank_id
+            )
+            cutoffs = {
+                "before": written - timedelta(seconds=1),
+                "at": written,
+                "after": written + timedelta(seconds=1),
+            }
+            scopes = [
+                MemoryScopeWatermark(
+                    key=f"{name}-{order}",
+                    since=since,
+                    tags=tags,
+                    tags_match=tags_match,
+                    fact_types=None,
+                )
+                for name, since in cutoffs.items()
+                for order, tags in (("ab", ["user_a", "team_red"]), ("ba", ["team_red", "user_a"]))
+            ]
+            scopes.append(
+                MemoryScopeWatermark(
+                    key="other-fact-type",
+                    since=cutoffs["before"],
+                    tags=["user_a", "team_red"],
+                    tags_match=tags_match,
+                    fact_types=["world"],
+                )
+            )
+            store = get_memories()
+            batch = await store.any_memory_updated_since_batch(
+                conn=conn, fq_table=fq_store_table, bank_id=bank_id, scopes=scopes
+            )
+            single = {
+                scope.key: await store.any_memory_updated_since(
+                    conn=conn,
+                    fq_table=fq_store_table,
+                    bank_id=bank_id,
+                    since=scope.since,
+                    tags=scope.tags,
+                    tags_match=scope.tags_match,
+                    fact_types=scope.fact_types,
+                )
+                for scope in scopes
+            }
+
+        assert (
+            batch
+            == single
+            == {
+                "before-ab": True,
+                "before-ba": True,
+                "at-ab": False,
+                "at-ba": False,
+                "after-ab": False,
+                "after-ba": False,
+                "other-fact-type": False,
+            }
+        )
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.memory_backend_incompatible
@@ -2925,33 +3011,33 @@ class TestMentalModelTriggerSchema:
     """Unit tests for MentalModelTrigger schema validation (no DB needed)."""
 
     def test_trigger_accepts_tags_match(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger(tags_match="any")
         assert t.tags_match == "any"
 
     def test_trigger_accepts_all_tags_match_modes(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         for mode in ("any", "all", "any_strict", "all_strict"):
             t = MentalModelTrigger(tags_match=mode)
             assert t.tags_match == mode
 
     def test_trigger_tags_match_defaults_to_none(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger()
         assert t.tags_match is None
 
     def test_trigger_accepts_tag_groups_leaf(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger(tag_groups=[{"tags": ["user:alice"], "match": "all_strict"}])
         assert len(t.tag_groups) == 1
         assert t.tag_groups[0].tags == ["user:alice"]
 
     def test_trigger_accepts_tag_groups_compound(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger(
             tag_groups=[
@@ -2970,14 +3056,14 @@ class TestMentalModelTriggerSchema:
         assert len(t.tag_groups[0].filters) == 2
 
     def test_trigger_tag_groups_defaults_to_none(self):
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger()
         assert t.tag_groups is None
 
     def test_trigger_roundtrip_via_model_dump(self):
         """Test that tag_groups survive model_dump -> model_validate (simulates DB storage)."""
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         t = MentalModelTrigger(
             tags_match="any",
@@ -2994,7 +3080,7 @@ class TestMentalModelTriggerSchema:
     def test_trigger_tag_groups_rejects_invalid(self):
         from pydantic import ValidationError
 
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         with pytest.raises(ValidationError):
             MentalModelTrigger(tag_groups=[{"invalid_key": "bad"}])

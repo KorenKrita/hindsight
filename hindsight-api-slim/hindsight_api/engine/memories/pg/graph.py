@@ -30,12 +30,14 @@ from __future__ import annotations
 import logging
 import time
 import uuid as uuid_module
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ....config import get_config
 from ...db.base import DatabaseConnection
+from ...db_utils import acquire_with_retry
 from ...search.tags import TagGroup, TagsMatch, build_tag_filter_clause
 from ..base import GRAPH_MAX_EDGES, EntityPrunePassResult, RelinkPassResult
 from .links import (
@@ -65,6 +67,11 @@ MAX_SEMANTIC_LINKS_PER_UNIT = 50
 # worker slot for minutes. Chosen so the typical iteration runs in well
 # under 1s.
 _DRAIN_BATCH_SIZE = 50
+
+# A claimed queue row is finished within one batch, well under a second; a claim
+# this old belongs to a batch that failed or a worker that died mid-batch, so the
+# row is claimable again. A failed batch is retried no sooner than this.
+_CLAIM_STALE_AFTER = timedelta(minutes=10)
 
 # Defensive guard against runaway relink loops — at _DRAIN_BATCH_SIZE units per
 # iteration that's 500k targets, far beyond any realistic single-bank backlog.
@@ -543,6 +550,32 @@ async def resolve_entity_names(
 # --------------------------------------------------------------- maintenance
 
 
+async def enqueue_graph_maintenance_at_commit(
+    conn: DatabaseConnection,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    unit_ids: Iterable[Any],
+) -> None:
+    """Queue ``unit_ids`` for relinking as the last statement of the caller's transaction.
+
+    The queue insert locks every already-queued row it touches (#3034), and those
+    locks last until commit. Run early in a retain or an edit, they made every other
+    writer of the same bank wait out that whole transaction (#6417). Held back to
+    commit time they last milliseconds, and the #3034 guarantee still holds: a
+    worker that claimed the row earlier loses the claim to this insert, so its
+    finishing delete leaves the row queued for a pass over the committed state.
+    """
+    table = fq_table("graph_maintenance_queue")
+
+    async def _flush(c: DatabaseConnection, ids: list[Any]) -> None:
+        await _ops_for(c).enqueue_graph_maintenance(c, table, bank_id, ids)
+
+    if isinstance(conn, DatabaseConnection):
+        await conn.add_before_commit(f"graph_maintenance:{table}:{bank_id}", unit_ids, _flush)
+    else:  # a bare driver connection (pool-level callers) has no commit hook
+        await _flush(conn, sorted(set(unit_ids)))
+
+
 async def enqueue_relink_victims(
     *,
     conn: DatabaseConnection,
@@ -576,7 +609,6 @@ async def enqueue_relink_victims(
     if not affected_unit_ids:
         return 0
 
-    ops = _ops_for(conn)
     affected_uuids = _as_uuids(affected_unit_ids)
     affected_str_set = {str(uid) for uid in affected_uuids}
 
@@ -603,12 +635,7 @@ async def enqueue_relink_victims(
     if not victim_ids:
         return 0
 
-    await ops.enqueue_graph_maintenance(
-        conn,
-        fq_table("graph_maintenance_queue"),
-        bank_id,
-        list(victim_ids),
-    )
+    await enqueue_graph_maintenance_at_commit(conn, fq_table, bank_id, victim_ids)
 
     logger.debug(
         f"[GRAPH_MAINT] Enqueued {len(victim_ids)} relink victims in "
@@ -665,20 +692,22 @@ async def relink_pass(
             drained = False
             break
 
-        from ...memory_engine import acquire_with_retry
-
+        queue = fq_table("graph_maintenance_queue")
+        claimed_at = datetime.now(UTC)
         async with acquire_with_retry(backend) as conn:
+            # Claim and relink in separate transactions (#6417): the claim's row
+            # locks last milliseconds, so writers re-queuing these units never wait
+            # out a relink, and the relink holds no queue lock until its final
+            # delete — a writer it waits on can always reach its own commit.
             async with conn.transaction():
                 unit_ids = await ops.claim_graph_maintenance_batch(
-                    conn,
-                    fq_table("graph_maintenance_queue"),
-                    bank_id,
-                    _DRAIN_BATCH_SIZE,
+                    conn, queue, bank_id, _DRAIN_BATCH_SIZE, claimed_at, claimed_at - _CLAIM_STALE_AFTER
                 )
-                if not unit_ids:
-                    break
-
+            if not unit_ids:
+                break
+            async with conn.transaction():
                 links_added += await _relink_batch(conn, fq_table, bank_id, unit_ids, ops, backend)
+                await ops.finish_graph_maintenance_batch(conn, queue, bank_id, unit_ids, claimed_at)
 
         units_processed += len(unit_ids)
         iterations += 1
@@ -790,8 +819,6 @@ async def _relink_batch(
         if counts.get((r["id"], "semantic"), 0) < MAX_SEMANTIC_LINKS_PER_UNIT and r["embedding"] is not None
     ]
     if semantic_needs:
-        from ...memory_engine import acquire_with_retry
-
         seed_ids = [r["id"] for r in semantic_needs]
         seed_embs = [r["embedding"] for r in semantic_needs]
         seed_ftypes = [r["fact_type"] for r in semantic_needs]
@@ -821,7 +848,6 @@ async def _relink_batch(
         conn,
         new_links,
         bank_id=bank_id,
-        skip_exists_check=False,
         ops=ops,
     )
     return len(new_links)
@@ -864,7 +890,9 @@ async def enqueue_entity_prune_candidates(
     queue_table = fq_table("entity_maintenance_queue")
     ue_table = fq_table("unit_entities")
     entities_table = fq_table("entities")
-    unit_uuids = _as_uuids(list(affected_unit_ids))
+    # Sorted before chunking: each chunk locks its memory rows ascending, so the
+    # whole call does too and two overlapping bulk releases cannot cycle (#6229).
+    unit_uuids = sorted(_as_uuids(list(affected_unit_ids)))
 
     # Chunked because a bulk delete can hand in thousands of unit ids and the
     # lookup binds them with `= ANY(...)`, which ops_oracle expands into a
@@ -876,6 +904,7 @@ async def enqueue_entity_prune_candidates(
             queue_table,
             entities_table,
             ue_table,
+            fq_table("memory_units"),
             bank_id,
             unit_uuids[start : start + _ENQUEUE_LOOKUP_CHUNK],
         )
@@ -936,7 +965,6 @@ async def entity_prune_pass(
         deadline stopped the drain with rows still queued.
     """
     from ...db_utils import retry_with_backoff
-    from ...memory_engine import acquire_with_retry
 
     examined = 0
     orphans_pruned = 0

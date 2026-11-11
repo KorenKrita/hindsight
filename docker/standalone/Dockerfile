@@ -185,6 +185,7 @@ WORKDIR /app
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
     procps \
+    ffmpeg \
     libssl3 \
     libgssapi-krb5-2 \
     libossp-uuid16 \
@@ -233,7 +234,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder; \
 print('Downloading embedding model...'); \
 SentenceTransformer('BAAI/bge-small-en-v1.5'); \
 print('Downloading cross-encoder model...'); \
-CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
+CrossEncoder('hindsight-ai/hs-rerank-1'); \
 print('Models cached successfully')" && break; \
       if [ "$i" -lt "$MAX_RETRIES" ]; then \
         echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \
@@ -338,6 +339,7 @@ WORKDIR /app
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
     procps \
+    ffmpeg \
     libssl3 \
     libgssapi-krb5-2 \
     libossp-uuid16 \
@@ -417,7 +419,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder; \
 print('Downloading embedding model...'); \
 SentenceTransformer('BAAI/bge-small-en-v1.5'); \
 print('Downloading cross-encoder model...'); \
-CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
+CrossEncoder('hindsight-ai/hs-rerank-1'); \
 print('Models cached successfully')" && break; \
       if [ "$i" -lt "$MAX_RETRIES" ]; then \
         echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \

@@ -19,6 +19,12 @@ from one place, so we don't spawn a separate ``asyncio`` task per concern:
   per-model schedule lives in the cron expression; this loop only decides when to
   *check*. The same scan runs ``trigger.full_refresh_cron``, the independent
   schedule on which a (typically delta) model gets a full-mode refresh (#4340).
+- **Attachment sweep** (configurable, default daily): delete the images and files
+  of retains that failed after the API stored them — attachments their document
+  still does not reference a day later (never created, or its update failed).
+  Discovery is one call to ``banks_with_attachments_in_window``.
+  Documents are read from the memories store, so this covers banks whose
+  documents live outside SQL too.
 
 The loop wakes on a short fixed tick and runs each job when its own
 ``last_run + interval`` is due (run-at-start, then on interval), so adding jobs
@@ -66,7 +72,9 @@ from typing import TYPE_CHECKING, Any
 
 from ..config import ConfigLike, get_config
 from ..models import RequestContext
+from ..schema_context import _current_schema
 from .db_utils import acquire_with_retry
+from .retain.attachment_store import ATTACHMENT_SWEEP_GRACE
 from .schema import _is_oracle, fq_routine, fq_table, fq_table_explicit
 
 if TYPE_CHECKING:
@@ -77,6 +85,12 @@ logger = logging.getLogger(__name__)
 
 # Short tick so jobs with different cadences share one loop without per-job tasks.
 _TICK_SECONDS = 60
+# How long stop() lets the job in progress reach a stopping point before cancelling it.
+_STOP_GRACE_SECONDS = 5.0
+# How long stop() then waits for the cancel to land. A job that suppresses or delays
+# cancellation (a call that does not yield, a cleanup that catches CancelledError) is
+# left behind after this rather than waited on.
+_STOP_CANCEL_GRACE_SECONDS = 5.0
 # ── retention sweep pacing ────────────────────────────────────────────────────
 # Retention used to issue one unbounded `DELETE FROM <table> WHERE started_at <
 # cutoff` per schema. On a table with a real backlog that is a single statement
@@ -102,6 +116,17 @@ _RETENTION_MAX_BATCHES = 1000
 # pods sweeping at once multiply that, which is still orders of magnitude gentler
 # than the unbounded delete this replaces.
 _RETENTION_BATCH_PAUSE_SECONDS = 0.25
+# ── attachment sweep ──────────────────────────────────────────────────────────
+# A retain's attachments are stored before the retain runs; one its document
+# still does not reference a day later — the document was never created, or an
+# update to it failed — belongs to a retain that failed. Only the past
+# week is checked, so a daily run asks about each attachment about seven times rather
+# than about every attachment the bank ever held.
+# An attachment orphaned before the job existed, or while every process was down
+# (or its retain queued) for over a week, falls out of the window: that is what
+# `hindsight-admin repair-bank --attachments` is for, the same rule with no
+# lower bound.
+_ATTACHMENT_SWEEP_LOOKBACK = timedelta(days=7)
 
 
 @dataclass(frozen=True)
@@ -155,14 +180,35 @@ class MaintenanceLoop:
             logger.debug("Cannot start maintenance loop: no running event loop")
 
     async def stop(self) -> None:
-        """Stop the loop and wait for the current tick to finish."""
+        """Stop the loop: let the current job reach its next stopping point, then cancel it.
+
+        A job can run for a long time (a scheduled-refresh pass over many models, a
+        reconcile over many banks), and shutdown waits on this. Every job is safe to
+        cut short: each unit of work is its own transaction, and whatever was not
+        reached is still due on the next tick of the next process.
+        """
         self._stop.set()
-        if self._task and not self._task.done():
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        task = self._task
         self._task = None
+        if task is None or task.done():
+            return
+        _, pending = await asyncio.wait({task}, timeout=_STOP_GRACE_SECONDS)
+        if pending:
+            logger.info(f"Maintenance: cancelling the job in progress after {_STOP_GRACE_SECONDS:.0f}s to stop")
+            task.cancel()
+            _, pending = await asyncio.wait({task}, timeout=_STOP_CANCEL_GRACE_SECONDS)
+            if pending:
+                logger.warning(
+                    f"Maintenance: the job in progress did not stop within {_STOP_CANCEL_GRACE_SECONDS:.0f}s "
+                    "of being cancelled; leaving it behind"
+                )
+                return
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Maintenance tick failed while stopping")
 
     @staticmethod
     def _any_job_enabled() -> bool:
@@ -176,7 +222,8 @@ class MaintenanceLoop:
         llm_on = sweep_on and cfg.llm_trace_enabled and cfg.llm_trace_retention_days > 0
         mm_refresh_on = cfg.mental_model_refresh_tick_seconds > 0
         op_cleanup_on = cfg.operation_cleanup_interval_seconds > 0 and cfg.operation_retention_days > 0
-        return reconcile_on or audit_on or llm_on or mm_refresh_on or op_cleanup_on
+        attachment_sweep_on = cfg.attachment_sweep_interval_seconds > 0
+        return reconcile_on or audit_on or llm_on or mm_refresh_on or op_cleanup_on or attachment_sweep_on
 
     # ── loop ───────────────────────────────────────────────────────────────
 
@@ -240,6 +287,9 @@ class MaintenanceLoop:
             and self._is_due("operation_cleanup", cleanup_interval)
         ):
             await self._run_timed("operation cleanup", self._run_operation_cleanup(cfg))
+        attachment_interval = cfg.attachment_sweep_interval_seconds
+        if attachment_interval > 0 and self._is_due("attachment_sweep", attachment_interval):
+            await self._run_timed("attachment sweep", self._run_attachment_sweep())
 
     async def _run_timed(self, name: str, coro: Coroutine[Any, Any, None]) -> None:
         """Run a maintenance job and emit one timing line for it.
@@ -386,8 +436,6 @@ class MaintenanceLoop:
             return
         known = {t.schema for t in tenants} | {get_config().database_schema}
 
-        from .memory_engine import _current_schema
-
         cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.operation_retention_days)
         pruned = 0
         for row in rows:
@@ -421,6 +469,65 @@ class MaintenanceLoop:
                 _current_schema.reset(token)
         if pruned:
             logger.info(f"Operation cleanup: pruned {pruned} operation(s) total")
+
+    # ── attachment sweep ─────────────────────────────────────────────────────
+
+    async def _run_attachment_sweep(self) -> None:
+        """Delete the attachments of retains that failed before writing their document.
+
+        Discovery is one cross-tenant round trip (``banks_with_attachments_in_window``)
+        returning the banks that stored an attachment in the window — a handful on a
+        large install — and the engine reads each of those banks' documents from its
+        memories store and drops the attachments the text does not show. Safe in
+        every process at once: the delete is idempotent, and a second sweeper finds
+        nothing left.
+        """
+        engine = self._engine
+        now = datetime.now(timezone.utc)
+        created_before = now - ATTACHMENT_SWEEP_GRACE
+        created_after = created_before - _ATTACHMENT_SWEEP_LOOKBACK
+        try:
+            async with acquire_with_retry(engine._backend, max_retries=1) as conn:
+                rows = await conn.fetch(
+                    f"SELECT schema_name, bank_id FROM {fq_routine('banks_with_attachments_in_window')}($1, $2)",
+                    created_after,
+                    created_before,
+                )
+        except Exception as e:
+            logger.warning(f"Attachment sweep discovery failed: {e}")
+            return
+        if not rows:
+            return
+        # Only schemas the deployment serves, like operation cleanup; the routine
+        # reports every schema owning an attachments table.
+        try:
+            tenants = await engine._tenant_extension.list_tenants()
+        except Exception as e:
+            logger.warning(f"Attachment sweep tenant discovery failed: {e}")
+            return
+        tenant_by_schema = {t.schema: t for t in tenants}
+        default_schema = get_config().database_schema
+
+        removed = 0
+        for row in rows:
+            if self._stop.is_set():
+                break
+            schema, bank_id = row["schema_name"], row["bank_id"]
+            tenant = tenant_by_schema.get(schema)
+            if tenant is None and schema != default_schema:
+                continue
+            token = _current_schema.set(schema)
+            try:
+                context = RequestContext(internal=True, tenant_id=tenant.tenant_id if tenant else None)
+                removed += await engine.reclaim_unreferenced_attachments(
+                    bank_id, created_after, created_before, context
+                )
+            except Exception as e:
+                logger.warning(f"Attachment sweep failed for bank {bank_id} in {schema}: {e}")
+            finally:
+                _current_schema.reset(token)
+        if removed:
+            logger.info(f"Attachment sweep: deleted {removed} attachment(s) of retains that failed")
 
     # ── consolidation reconcile ──────────────────────────────────────────────
 
@@ -464,11 +571,11 @@ class MaintenanceLoop:
         if not targets:
             return
 
-        from .memory_engine import _current_schema
-
         submitted = 0
         skipped_unknown = 0
         for target in targets:
+            if self._stop.is_set():
+                break
             schema = target.schema_name
             bank_id = target.bank_id
             tenant = tenant_by_schema.get(schema)
@@ -505,8 +612,6 @@ class MaintenanceLoop:
         The schema is set for each, as a request would set it: a store derives where a bank's
         memories live from it.
         """
-        from .memory_engine import _current_schema
-
         engine = self._engine
         found: list[_ReconcileTarget] = []
         for schema in sorted(schemas):
@@ -608,14 +713,14 @@ class MaintenanceLoop:
         tenant_by_schema = {t.schema: t for t in tenants}
         default_schema = get_config().database_schema
 
-        from .memory_engine import _current_schema
-
         submitted = 0
         skipped_unknown = 0
         skipped_fresh = 0
         skipped_in_flight = 0
         skipped_paused = 0
         for item in due:
+            if self._stop.is_set():
+                break
             row = item.row
             schema = row["schema_name"]
             bank_id = row["bank_id"]
